@@ -43,6 +43,14 @@ class ServerBenchmarkerProgress(
             if scheduler_state.progress.remaining_fraction is not None
             else 0.0
         )
+
+        if progress and progress > 0:
+            print(f"Progress: {progress}")
+        if scheduler_state and scheduler_state.progress:
+            print(
+                f"Total requests: {scheduler_state.progress.total_requests}, Created requests: {scheduler_state.created_requests}, processed requests: {scheduler_state.processed_requests}"
+            )
+
         await self._update_progress(progress)
 
     async def on_benchmark_complete(self, benchmark: GenerativeBenchmark):

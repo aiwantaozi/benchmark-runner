@@ -458,7 +458,7 @@ def run(**kwargs):  # noqa: C901
             scenario=kwargs.pop("scenario", None), **kwargs
         )
 
-        args.data = prepare_datasets(
+        args.data, args.max_requests = prepare_datasets(
             data=args.data,
             tokenizer=args.processor,
             max_items=args.max_requests,
