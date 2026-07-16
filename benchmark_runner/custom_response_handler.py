@@ -4,34 +4,45 @@ Custom response handler that fixes TTFT and ITL calculation for models with reas
 This handler extends guidellm's ChatCompletionsResponseHandler to properly handle
 both regular content tokens and reasoning_content tokens, ensuring accurate timing metrics.
 
+guidellm 0.7.1 note:
+- Handlers still live in ``guidellm.backends.openai.request_handlers`` and are
+  registered on ``OpenAIRequestHandlerFactory``. The stock factory registers the
+  built-in handlers by API PATH (e.g. ``/v1/chat/completions``); we register this
+  one by the distinct NAME ``chat_completions_with_reasoning`` and select it via
+  the backend's ``request_handlers`` override (path -> handler name).
+- v0.7.1's ``ChatCompletionsRequestHandler`` already fires TTFT on reasoning
+  deltas; this subclass preserves the 0.6.0 behavior where reasoning content is
+  also accumulated as generated text so ITL is measured across every token.
+
 Usage:
-    To use this handler, pass it via backend_kwargs when running benchmarks:
+    Select this handler through the ``openai_http_error_detail`` backend, keying
+    ``request_handlers`` by API path -> registered handler name:
 
     benchmark-runner benchmark run \\
-        --target http://localhost:8000/v1 \\
-        --backend openai_http \\
-        --backend-kwargs '{"response_handlers": {"chat_completions": "chat_completions_with_reasoning"}}' \\
+        --target http://localhost:8000 \\
+        --backend openai_http_error_detail \\
+        --backend-kwargs \\
+          '{"request_handlers": {"/v1/chat/completions": "chat_completions_with_reasoning"}}' \\
         --model your-model-name \\
         --data your-dataset
 
-    Or in a scenario config file:
+    Or in a scenario config file (spec.backend):
     {
-        "backend_kwargs": {
-            "response_handlers": {
-                "chat_completions": "chat_completions_with_reasoning"
-            }
+        "kind": "openai_http_error_detail",
+        "request_handlers": {
+            "/v1/chat/completions": "chat_completions_with_reasoning"
         }
     }
 """
 
-from guidellm.backends.response_handlers import (
-    ChatCompletionsResponseHandler,
-    GenerationResponseHandlerFactory,
+from guidellm.backends.openai.request_handlers import (
+    ChatCompletionsRequestHandler,
+    OpenAIRequestHandlerFactory,
 )
 
 
-@GenerationResponseHandlerFactory.register("chat_completions_with_reasoning")
-class ChatCompletionsWithReasoningResponseHandler(ChatCompletionsResponseHandler):
+@OpenAIRequestHandlerFactory.register("chat_completions_with_reasoning")
+class ChatCompletionsWithReasoningResponseHandler(ChatCompletionsRequestHandler):
     """
     Response handler for chat completions that supports reasoning tokens.
 

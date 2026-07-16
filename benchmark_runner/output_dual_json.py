@@ -6,21 +6,34 @@ This module implements a dual-output JSON handler that saves both:
 2. Full JSON - Contains complete benchmark data including all requests
 
 Both files are saved to the same directory with clear naming conventions.
+
+guidellm 0.7.1 note:
+- Output formatters are resolved by ``GenerativeBenchmarkerOutput.resolve(args)``
+  which looks up the implementation by ``args.kind`` and calls its ``from_args``
+  factory. So a custom output needs BOTH a ``BenchmarkOutputArgs`` subclass (the
+  spec, registered by kind) AND the ``GenerativeBenchmarkerOutput`` implementation
+  (registered by the same kind) implementing ``from_args``.
+- Response handlers still live in ``guidellm.backends.openai.request_handlers``
+  with ``OpenAIRequestHandlerFactory`` (used by the JSON encoder fallback to map a
+  handler class back to its registered name).
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import Field
 
-
 from guidellm.benchmark.outputs.output import GenerativeBenchmarkerOutput
-from guidellm.benchmark.schemas import GenerativeBenchmarksReport
+from guidellm.benchmark.schemas import BenchmarkOutputArgs, GenerativeBenchmarksReport
 
-__all__ = ["GenerativeBenchmarkerDualJson", "AutoMarshalJSONEncoder"]
+__all__ = [
+    "GenerativeBenchmarkerDualJson",
+    "DualJsonBenchmarkOutputArgs",
+    "AutoMarshalJSONEncoder",
+]
 
 
 class AutoMarshalJSONEncoder(json.JSONEncoder):
@@ -50,14 +63,16 @@ class AutoMarshalJSONEncoder(json.JSONEncoder):
         if hasattr(o, "__json__") and callable(getattr(o, "__json__")):
             return o.__json__()
 
-        # Handle class/type objects (like response handler classes)
+        # Handle class/type objects (like request handler classes)
         if isinstance(o, type):
-            # Try to find the registered name for this handler class
-            from guidellm.backends.response_handlers import (
-                GenerationResponseHandlerFactory,
+            # Try to find the registered name for this handler class.
+            # guidellm 0.7.1: request handlers live in
+            # guidellm.backends.openai.request_handlers with OpenAIRequestHandlerFactory.
+            from guidellm.backends.openai.request_handlers import (
+                OpenAIRequestHandlerFactory,
             )
 
-            registry = GenerationResponseHandlerFactory.registry or {}
+            registry = OpenAIRequestHandlerFactory.registry or {}
             class_to_name = {v: k for k, v in registry.items()}
 
             handler_name = class_to_name.get(o)
@@ -69,6 +84,33 @@ class AutoMarshalJSONEncoder(json.JSONEncoder):
 
         # Let the base class handle other types or raise TypeError
         return super().default(o)
+
+
+@BenchmarkOutputArgs.register("dual_json")
+class DualJsonBenchmarkOutputArgs(BenchmarkOutputArgs):
+    """Spec model for the dual-JSON output (summary + full)."""
+
+    kind: Literal["dual_json"] = Field(
+        default="dual_json",
+        description="The kind of output.",
+        examples=["dual_json"],
+    )
+    path: Path = Field(
+        default=Path("./benchmarks.json"),
+        description=(
+            "Directory or summary file path. The full report is written alongside "
+            "with a '.full' suffix inserted before the extension."
+        ),
+        examples=["./benchmarks.json"],
+    )
+    error_limit: int | None = Field(
+        default=20,
+        description="Maximum number of errored requests to include in the summary.",
+    )
+    incomplete_limit: int | None = Field(
+        default=20,
+        description="Maximum number of incomplete requests to include in the summary.",
+    )
 
 
 @GenerativeBenchmarkerOutput.register("dual_json")
@@ -119,36 +161,27 @@ class GenerativeBenchmarkerDualJson(GenerativeBenchmarkerOutput):
     )
 
     @classmethod
-    def validated_kwargs(
-        cls,
-        output_path: str | Path | None,
-        error_limit: int | None = None,
-        incomplete_limit: int | None = None,
-        **_kwargs,
-    ) -> dict[str, Any]:
+    def from_args(cls, args: BenchmarkOutputArgs) -> GenerativeBenchmarkerDualJson:
         """
-        Validate and normalize keyword arguments for output path.
+        Create a dual-JSON output formatter from output arguments.
 
-        Args:
-            output_path: Directory or file path for serialization output.
-            _kwargs: Additional keyword arguments (ignored).
-        Returns:
-            Dictionary of validated keyword arguments for class initialization.
+        :param args: Output configuration with path/limits and kind ``dual_json``
+        :return: Configured dual-JSON output formatter
         """
-        validated: dict[str, Any] = {}
-        if output_path is not None:
-            output_path = (
-                output_path if isinstance(output_path, Path) else Path(output_path)
-            )
-            if output_path.suffix.lower() == ".dual_json":
-                output_path = output_path.with_suffix(".json")
-            validated["output_path"] = output_path
+        if not isinstance(args, DualJsonBenchmarkOutputArgs):
+            raise ValueError(f"Invalid args type: {type(args)}.")
 
-        if error_limit is not None:
-            validated["error_limit"] = error_limit
-        if incomplete_limit is not None:
-            validated["incomplete_limit"] = incomplete_limit
-        return validated
+        output_path = args.path
+        # A ".dual_json" suffix (from a bare id like "123.dual_json") is normalized
+        # back to ".json" so the summary file uses the standard extension.
+        if output_path.suffix.lower() == ".dual_json":
+            output_path = output_path.with_suffix(".json")
+
+        return cls(
+            output_path=output_path,
+            error_limit=args.error_limit,
+            incomplete_limit=args.incomplete_limit,
+        )
 
     async def finalize(self, report: GenerativeBenchmarksReport) -> Path:
         """
@@ -172,12 +205,15 @@ class GenerativeBenchmarkerDualJson(GenerativeBenchmarkerOutput):
         # Ensure parent directory exists
         summary_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Prepare data
-        full_dict = report.model_dump()
-        summary_dict = report.model_dump(exclude=self.EXCLUDE_FIELDS)
+        # Prepare data. Use mode="json" so pydantic serializes non-JSON-native
+        # leaves (e.g. Path in the embedded scenario config, enums, datetimes) to
+        # JSON-compatible values; guidellm 0.7.1 embeds the BenchmarkScenario
+        # (with Path output targets) in report.config.
+        full_dict = report.model_dump(mode="json")
+        summary_dict = report.model_dump(mode="json", exclude=self.EXCLUDE_FIELDS)
         self._attach_error_samples(summary_dict, full_dict)
 
-        # Use custom encoder to handle response handler classes
+        # Use custom encoder to handle request handler classes
         encoder_cls = AutoMarshalJSONEncoder
 
         # Save summary JSON
