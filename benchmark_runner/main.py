@@ -1,5 +1,5 @@
 # The functions in this file are adapted from:
-# https://github.com/vllm-project/guidellm/blob/0d730d28d32b0f1e75232b2129ecf85c82c141eb/src/guidellm/__main__.py
+# https://github.com/vllm-project/guidellm/blob/v0.7.1/src/guidellm/cli/run.py
 # Modifications have been made to fit project requirements.
 
 """
@@ -8,11 +8,18 @@ Benchmark Runner command-line interface entry point.
 This is the main CLI for Benchmark Runner, customized for this project.
 Key customizations:
 - Uses custom progress and output modules (see benchmark_runner.progress, benchmark_runner.chained_progress).
+- Adds the adaptive ramp auto-tune engine (--auto-tune, see benchmark_runner.auto_tune).
 - Removes unnecessary subcommands, focusing on core benchmark and config functionality.
 
-Provides:
-- Benchmark execution for generative models.
-- Configuration display.
+guidellm 0.7.1 notes:
+- The benchmark is driven by ``BenchmarkScenario.create(spec=..., ...)`` +
+  ``benchmark_generative_text(args=scenario, ...)``; the old flat
+  ``BenchmarkGenerativeTextArgs`` was removed. The scenario spec is built from the
+  CLI options by ``benchmark_runner.scenario_builder.build_scenario_args``.
+- Request handlers still live in ``guidellm.backends.openai.request_handlers`` on
+  ``OpenAIRequestHandlerFactory`` (registered by API PATH). The custom
+  reasoning-aware handler is selected through the ``openai_http_error_detail``
+  backend's ``request_handlers`` field (path -> registered handler name).
 """
 
 from __future__ import annotations
@@ -27,39 +34,126 @@ from pydantic import ValidationError
 from benchmark_runner.chained_progress import ChainedBenchmarkerProgress
 from benchmark_runner.openai_http_error_detail_backend import (
     ERROR_DETAIL_BACKEND_TYPE,
-    OpenAIHTTPErrorDetailBackend,
 )
+from benchmark_runner.scenario_builder import build_scenario_args
 from guidellm.benchmark.entrypoints import benchmark_generative_text
 from benchmark_runner.progress import ServerBenchmarkerProgress
-from benchmark_runner.sharegpt_adapter import prepare_datasets
-from guidellm.backends.response_handlers import GenerationResponseHandlerFactory
+from benchmark_runner.auto_tune import AutoTuneConfig, run_ramp
 
 try:
     import uvloop
 except ImportError:
     uvloop = None  # type: ignore[assignment] # Optional dependency
 
-from guidellm.backends import BackendType
 from guidellm.benchmark import (
-    BenchmarkGenerativeTextArgs,
     GenerativeConsoleBenchmarkerProgress,
-    ProfileType,
     get_builtin_scenarios,
 )
-from guidellm.scheduler import StrategyType
-from guidellm.schemas import GenerativeRequestType
 from guidellm.settings import print_config, settings as guidellm_settings
-from guidellm.utils import Console, DefaultGroupHandler, get_literal_vals
+from guidellm.utils.console import Console
+from guidellm.utils.default_group import DefaultGroupHandler
 from guidellm.utils import cli as cli_tools
 
-"""Available strategy and profile type choices for benchmark execution."""
-STRATEGY_PROFILE_CHOICES: list[str] = list(get_literal_vals(ProfileType | StrategyType))
+# guidellm 0.7.1 removed the ProfileType/StrategyType/BackendType Literal aliases
+# that older builds imported. The valid profile/strategy names are the registered
+# ProfileArgs kinds; we list them here for the --profile choice.
+STRATEGY_PROFILE_CHOICES: list[str] = [
+    "synchronous",
+    "concurrent",
+    "throughput",
+    "sweep",
+    "async",
+    "constant",
+    "poisson",
+]
 
 """Available backend type choices for benchmark execution."""
 BACKEND_CHOICES: list[str] = [
-    *list(get_literal_vals(BackendType)),
+    "openai_http",
     ERROR_DETAIL_BACKEND_TYPE,
 ]
+
+# Literal defaults for the CLI options. Replaces 0.6.0's
+# ``BenchmarkGenerativeTextArgs.get_default(...)`` (that class was removed in
+# guidellm 0.7.1). ``set_if_not_default`` drops any option left at its default so
+# only user-provided values are threaded into the scenario spec.
+_OPTION_DEFAULTS: dict = {
+    "profile": "sweep",
+    "rate": None,
+    "backend": "openai_http",
+    "backend_kwargs": None,
+    "processor": None,
+    "processor_args": None,
+    "data_args": None,
+    "data_samples": -1,
+    "data_column_mapper": None,
+    "data_sampler": None,
+    "data_num_workers": None,
+    "dataloader_kwargs": None,
+    "random_seed": 42,
+    "seed_increment": True,
+    "output_dir": None,
+    "outputs": None,
+    "warmup": None,
+    "cooldown": None,
+    "rampup": None,
+    "max_seconds": None,
+    "max_requests": None,
+    "max_errors": None,
+    "max_error_rate": None,
+    "max_global_error_rate": None,
+}
+
+
+def _opt_default(name: str):
+    """Return the literal click default for an option (see ``_OPTION_DEFAULTS``)."""
+    return _OPTION_DEFAULTS.get(name)
+
+
+# guidellm 0.7.1's ``guidellm.utils.cli`` no longer ships ``parse_list_floats`` or
+# ``parse_json`` (only parse_list / parse_kv_str / parse_overrides / Union /
+# set_if_not_default remain). We provide local click callbacks with the same
+# behavior the benchmark-runner options relied on.
+def _split_floats(value: str) -> list[float]:
+    return [float(part) for part in str(value).split(",") if part.strip() != ""]
+
+
+def _cb_list_floats(ctx, param, value):
+    """Parse comma-separated floats. For ``multiple`` options returns a tuple of
+    lists (one per occurrence); otherwise a single list. ``None``/empty pass through.
+    """
+    if value is None or value == ():
+        return None
+    if isinstance(value, tuple):
+        return tuple(_split_floats(item) for item in value)
+    return _split_floats(value)
+
+
+def _parse_json_scalar(value):
+    import json as _json
+
+    if value is None or isinstance(value, (dict, list, int, float)):
+        return value
+    text = str(value).strip()
+    if text == "":
+        return None
+    try:
+        return _json.loads(text)
+    except (ValueError, TypeError):
+        # Fall back to a bare string; downstream models coerce (e.g. warmup) or
+        # the value is used verbatim.
+        return value
+
+
+def _cb_parse_json(ctx, param, value):
+    """Parse a JSON string (or key=value-ish scalar). Handles ``multiple`` options
+    by parsing each occurrence into a tuple."""
+    if value is None or value == ():
+        return None
+    if isinstance(value, tuple):
+        return tuple(_parse_json_scalar(item) for item in value)
+    return _parse_json_scalar(value)
+
 
 DISABLE_MACOS_WORKAROUNDS_ENV = "BENCHMARK_RUNNER_DISABLE_MACOS_WORKAROUNDS"
 """Set to 1/true/yes to disable runtime macOS defaults for process/data workers."""
@@ -153,18 +247,138 @@ def benchmark():
     ),
 )
 @click.option(
+    "--stages",
+    "stages",
+    callback=_cb_parse_json,
+    default=None,
+    help=(
+        "JSON list of per-stage configs (v2.1 stages model). Each item: "
+        '{"rate": float, "max_requests"?: int, "max_seconds"?: float}. When set, '
+        "runs one single-rate concurrent benchmark per stage with that stage's own "
+        "constraints, writing separate output files ({base}__stage{i}.{ext})."
+    ),
+)
+# ── Adaptive ramp auto-tune ───────────────────────────────────────────────────
+@click.option(
+    "--auto-tune",
+    "auto_tune",
+    is_flag=True,
+    default=False,
+    help=(
+        "Enable the adaptive ramp auto-tune engine (geometric bracket + binary "
+        "search). Probes ONE answer: peak throughput (no SLA) or the SLA-capacity "
+        "boundary (any --sla-* set). Mutually exclusive with --profile/--stages."
+    ),
+)
+@click.option(
+    "--axis",
+    "axis",
+    type=click.Choice(["rate", "concurrency"]),
+    default="rate",
+    help="Auto-tune load axis: 'rate' (constant, open-loop) or 'concurrency' "
+    "(concurrent, closed-loop).",
+)
+@click.option(
+    "--lower-bound",
+    "lower_bound",
+    type=float,
+    default=1.0,
+    help="Auto-tune knob lower bound (starting point).",
+)
+@click.option(
+    "--upper-bound",
+    "upper_bound",
+    type=float,
+    default=1024.0,
+    help="Auto-tune knob upper bound (ceiling to prevent runaway doubling).",
+)
+@click.option(
+    "--multiplier",
+    "multiplier",
+    type=float,
+    default=None,
+    help="Auto-tune per-point request multiplier (number = max(min_requests, "
+    "round(knob*multiplier))). Default: 10 (concurrency) / 30 (rate).",
+)
+@click.option(
+    "--min-requests",
+    "min_requests",
+    type=int,
+    default=30,
+    help="Auto-tune per-point minimum request count (measurement-window floor).",
+)
+@click.option(
+    "--max-points",
+    "max_points",
+    type=int,
+    default=12,
+    help="Auto-tune max number of measured points (guards a too-flat curve).",
+)
+@click.option(
+    "--max-total-seconds",
+    "max_total_seconds",
+    type=float,
+    default=1800.0,
+    help="Auto-tune total wall-clock budget across all points (seconds).",
+)
+@click.option(
+    "--sla-avg-ttft-ms",
+    "sla_avg_ttft_ms",
+    type=float,
+    default=None,
+    help="Auto-tune SLA target: max acceptable avg TTFT in ms (setting any --sla-* "
+    "switches the target to the SLA-capacity boundary).",
+)
+@click.option(
+    "--sla-avg-tpot-ms",
+    "sla_avg_tpot_ms",
+    type=float,
+    default=None,
+    help="Auto-tune SLA target: max acceptable avg TPOT in ms.",
+)
+@click.option(
+    "--sla-p99-ttft-ms",
+    "sla_p99_ttft_ms",
+    type=float,
+    default=None,
+    help="Auto-tune SLA target: max acceptable p99 TTFT in ms.",
+)
+@click.option(
+    "--sla-p99-tpot-ms",
+    "sla_p99_tpot_ms",
+    type=float,
+    default=None,
+    help="Auto-tune SLA target: max acceptable p99 TPOT in ms.",
+)
+@click.option(
+    "--sla-avg-latency-ms",
+    "sla_avg_latency_ms",
+    type=float,
+    default=None,
+    help="Auto-tune SLA target: max acceptable avg end-to-end request latency "
+    "in ms (guidellm reports latency in seconds; converted internally).",
+)
+@click.option(
+    "--sla-p99-latency-ms",
+    "sla_p99_latency_ms",
+    type=float,
+    default=None,
+    help="Auto-tune SLA target: max acceptable p99 end-to-end request latency "
+    "in ms (guidellm reports latency in seconds; converted internally).",
+)
+@click.option(
     "--profile",
     "--rate-type",  # legacy alias
     "profile",
-    default=BenchmarkGenerativeTextArgs.get_default("profile"),
+    default=_opt_default("profile"),
     type=click.Choice(STRATEGY_PROFILE_CHOICES),
     help=f"Benchmark profile type. Options: {', '.join(STRATEGY_PROFILE_CHOICES)}.",
 )
 @click.option(
     "--rate",
-    callback=cli_tools.parse_list_floats,
+    callback=_cb_list_floats,
     multiple=True,
-    default=BenchmarkGenerativeTextArgs.get_default("rate"),
+    default=_opt_default("rate"),
     help=(
         "Benchmark rate(s) to test. Meaning depends on profile: "
         "sweep=number of benchmarks, concurrent=concurrent requests, "
@@ -177,42 +391,27 @@ def benchmark():
     "--backend-type",  # legacy alias
     "backend",
     type=click.Choice(BACKEND_CHOICES),
-    default=BenchmarkGenerativeTextArgs.get_default("backend"),
+    default=_opt_default("backend"),
     help=f"Backend type. Options: {', '.join(BACKEND_CHOICES)}.",
 )
 @click.option(
     "--backend-kwargs",
     "--backend-args",  # legacy alias
     "backend_kwargs",
-    callback=cli_tools.parse_json,
-    default=BenchmarkGenerativeTextArgs.get_default("backend_kwargs"),
+    callback=_cb_parse_json,
+    default=_opt_default("backend_kwargs"),
     help="JSON string of arguments to pass to the backend.",
 )
 @click.option(
     "--model",
-    default=BenchmarkGenerativeTextArgs.get_default("model"),
+    default=None,
     type=str,
     help="Model ID to benchmark. If not provided, uses first available model.",
 )
 # Data configuration
 @click.option(
-    "--request-type",
-    default=BenchmarkGenerativeTextArgs.get_default("data_request_formatter"),
-    type=click.Choice(list(get_literal_vals(GenerativeRequestType))),
-    help=(
-        f"Request type to create for each data sample. "
-        f"Options: {', '.join(get_literal_vals(GenerativeRequestType))}."
-    ),
-)
-@click.option(
-    "--request-formatter-kwargs",
-    default=None,
-    callback=cli_tools.parse_json,
-    help="JSON string of arguments to pass to the request formatter.",
-)
-@click.option(
     "--processor",
-    default=BenchmarkGenerativeTextArgs.get_default("processor"),
+    default=_opt_default("processor"),
     type=str,
     help=(
         "Processor or tokenizer for token count calculations. "
@@ -221,20 +420,20 @@ def benchmark():
 )
 @click.option(
     "--processor-args",
-    default=BenchmarkGenerativeTextArgs.get_default("processor_args"),
-    callback=cli_tools.parse_json,
+    default=_opt_default("processor_args"),
+    callback=_cb_parse_json,
     help="JSON string of arguments to pass to the processor constructor.",
 )
 @click.option(
     "--data-args",
     multiple=True,
-    default=BenchmarkGenerativeTextArgs.get_default("data_args"),
-    callback=cli_tools.parse_json,
+    default=_opt_default("data_args"),
+    callback=_cb_parse_json,
     help="JSON string of arguments to pass to dataset creation.",
 )
 @click.option(
     "--data-samples",
-    default=BenchmarkGenerativeTextArgs.get_default("data_samples"),
+    default=_opt_default("data_samples"),
     type=int,
     help=(
         "Number of samples from dataset. -1 (default) uses all samples "
@@ -243,46 +442,55 @@ def benchmark():
 )
 @click.option(
     "--data-column-mapper",
-    default=BenchmarkGenerativeTextArgs.get_default("data_column_mapper"),
-    callback=cli_tools.parse_json,
+    default=_opt_default("data_column_mapper"),
+    callback=_cb_parse_json,
     help="JSON string of column mappings to apply to the dataset.",
 )
 @click.option(
     "--data-sampler",
-    default=BenchmarkGenerativeTextArgs.get_default("data_sampler"),
+    default=_opt_default("data_sampler"),
     type=click.Choice(["shuffle"]),
     help="Data sampler type.",
 )
 @click.option(
     "--data-num-workers",
-    default=BenchmarkGenerativeTextArgs.get_default("data_num_workers"),
+    default=_opt_default("data_num_workers"),
     type=int,
     help="Number of worker processes for data loading.",
 )
 @click.option(
     "--dataloader-kwargs",
-    default=BenchmarkGenerativeTextArgs.get_default("dataloader_kwargs"),
-    callback=cli_tools.parse_json,
+    default=_opt_default("dataloader_kwargs"),
+    callback=_cb_parse_json,
     help="JSON string of arguments to pass to the dataloader constructor.",
 )
 @click.option(
     "--random-seed",
-    default=BenchmarkGenerativeTextArgs.get_default("random_seed"),
+    default=_opt_default("random_seed"),
     type=int,
-    help="Random seed for reproducibility.",
+    help="Random seed for reproducibility. In --auto-tune this is the seed base "
+    "(each point uses random_seed + point_index).",
+)
+@click.option(
+    "--seed-increment/--no-seed-increment",
+    "seed_increment",
+    default=_opt_default("seed_increment"),
+    help="In --auto-tune, increment the seed per point (base + point_index) so "
+    "points differ (default). --no-seed-increment pins the same seed for every "
+    "point. Only affects the Random synthetic dataset.",
 )
 # Output configuration
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
-    default=BenchmarkGenerativeTextArgs.get_default("output_dir"),
+    default=_opt_default("output_dir"),
     help="The directory path to save file output types in",
 )
 @click.option(
     "--outputs",
     callback=cli_tools.parse_list,
     multiple=True,
-    default=BenchmarkGenerativeTextArgs.get_default("outputs"),
+    default=_opt_default("outputs"),
     help=(
         "The filename.ext for each of the outputs to create or the "
         "alises (json, csv, html) for the output files to create with "
@@ -319,36 +527,28 @@ def benchmark():
     "--warmup",
     "--warmup-percent",  # legacy alias
     "warmup",
-    default=BenchmarkGenerativeTextArgs.get_default("warmup"),
-    callback=cli_tools.parse_json,
+    default=_opt_default("warmup"),
+    callback=_cb_parse_json,
     help=(
-        "Warmup specification: int, float, or dict as string "
-        "(json or key=value). "
-        "Controls time or requests before measurement starts. "
-        "Numeric in (0, 1): percent of duration or request count. "
-        "Numeric >=1: duration in seconds or request count. "
-        "Advanced config: see TransientPhaseConfig schema."
+        "Warmup specification: int, float, or dict as string (json or key=value). "
+        "Controls time or requests before measurement starts."
     ),
 )
 @click.option(
     "--cooldown",
     "--cooldown-percent",  # legacy alias
     "cooldown",
-    default=BenchmarkGenerativeTextArgs.get_default("cooldown"),
-    callback=cli_tools.parse_json,
+    default=_opt_default("cooldown"),
+    callback=_cb_parse_json,
     help=(
-        "Cooldown specification: int, float, or dict as string "
-        "(json or key=value). "
-        "Controls time or requests after measurement ends. "
-        "Numeric in (0, 1): percent of duration or request count. "
-        "Numeric >=1: duration in seconds or request count. "
-        "Advanced config: see TransientPhaseConfig schema."
+        "Cooldown specification: int, float, or dict as string (json or key=value). "
+        "Controls time or requests after measurement ends."
     ),
 )
 @click.option(
     "--rampup",
     type=float,
-    default=BenchmarkGenerativeTextArgs.get_default("rampup"),
+    default=_opt_default("rampup"),
     help=(
         "The time, in seconds, to ramp up the request rate over. "
         "Only applicable for Throughput/Concurrent strategies"
@@ -368,7 +568,7 @@ def benchmark():
 @click.option(
     "--max-seconds",
     type=float,
-    default=BenchmarkGenerativeTextArgs.get_default("max_seconds"),
+    default=_opt_default("max_seconds"),
     help=(
         "Maximum seconds per benchmark. "
         "If None, runs until max_requests or data exhaustion."
@@ -377,7 +577,7 @@ def benchmark():
 @click.option(
     "--max-requests",
     type=int,
-    default=BenchmarkGenerativeTextArgs.get_default("max_requests"),
+    default=_opt_default("max_requests"),
     help=(
         "Maximum requests per benchmark. "
         "If None, runs until max_seconds or data exhaustion."
@@ -386,25 +586,25 @@ def benchmark():
 @click.option(
     "--max-errors",
     type=int,
-    default=BenchmarkGenerativeTextArgs.get_default("max_errors"),
+    default=_opt_default("max_errors"),
     help="Maximum errors before stopping the benchmark.",
 )
 @click.option(
     "--max-error-rate",
     type=float,
-    default=BenchmarkGenerativeTextArgs.get_default("max_error_rate"),
+    default=_opt_default("max_error_rate"),
     help="Maximum error rate before stopping the benchmark.",
 )
 @click.option(
     "--max-global-error-rate",
     type=float,
-    default=BenchmarkGenerativeTextArgs.get_default("max_global_error_rate"),
+    default=_opt_default("max_global_error_rate"),
     help="Maximum global error rate across all benchmarks.",
 )
 @click.option(
     "--over-saturation",
     "over_saturation",
-    callback=cli_tools.parse_json,
+    callback=_cb_parse_json,
     default=None,
     help=(
         "Enable over-saturation detection. "
@@ -417,7 +617,7 @@ def benchmark():
     "--detect-saturation",
     "--default-over-saturation",
     "over_saturation",
-    callback=cli_tools.parse_json,
+    callback=_cb_parse_json,
     flag_value='{"enabled": true}',
     help="Enable over-saturation detection with default settings.",
 )
@@ -438,23 +638,27 @@ def run(**kwargs):  # noqa: C901
     kwargs = cli_tools.set_if_not_default(click.get_current_context(), **kwargs)
     apply_macos_runtime_workarounds(kwargs)
 
-    use_error_detail_backend = kwargs.get("backend") == ERROR_DETAIL_BACKEND_TYPE
-    if use_error_detail_backend:
-        # Keep args validation compatible with GuideLLM's current BackendType literal.
-        # We swap in the custom backend instance after args are created.
-        kwargs["backend"] = BenchmarkGenerativeTextArgs.get_default("backend")
+    # guidellm 0.7.1: target/model are backend concerns and are folded into the
+    # scenario's ``spec.backend`` (see scenario_builder.build_scenario_args). We
+    # gather any extra backend options from --backend-kwargs here, plus target and
+    # model, and normalize the custom-handler override to the backend's
+    # ``request_handlers`` field (keyed by API path -> registered handler NAME).
+    #
+    # NOTE (0.7.1): the ``OpenAIRequestHandlerFactory`` registers handlers by API
+    # PATH, and our ``openai_http_error_detail`` backend exposes a
+    # ``request_handlers`` field (path -> handler name string) that it resolves to
+    # classes at runtime. We therefore pass handler names as STRINGS and keep the
+    # key path-based. A legacy ``response_handlers`` (request_type keyed) dict is
+    # translated to the path-keyed ``request_handlers`` form for compatibility.
+    backend_kwargs = dict(kwargs.pop("backend_kwargs", None) or {})
+    for alias in ("target", "model"):
+        value = kwargs.pop(alias, None)
+        if value is not None:
+            backend_kwargs[alias] = value
 
-    # Handle remapping for request params
-    request_type = kwargs.pop("request_type", None)
-    request_formatter_kwargs = kwargs.pop("request_formatter_kwargs", None)
-    if request_type is not None:
-        kwargs["data_request_formatter"] = (
-            request_type
-            if not request_formatter_kwargs
-            else {"request_type": request_type, **request_formatter_kwargs}
-        )
-    elif request_formatter_kwargs is not None:
-        kwargs["data_request_formatter"] = request_formatter_kwargs
+    _normalize_request_handlers(backend_kwargs)
+    if backend_kwargs:
+        kwargs["backend_kwargs"] = backend_kwargs
 
     # Handle output path remapping
     if (output_path := kwargs.pop("output_path", None)) is not None:
@@ -473,29 +677,21 @@ def run(**kwargs):  # noqa: C901
         kwargs.pop("disable_console_interactive", False) or disable_console
     )
     console = Console() if not disable_console else None
-    envs = cli_tools.list_set_env()
-    if console and envs:
-        console.print_update(
-            title=(
-                "Note: the following environment variables "
-                "are set and **may** affect configuration"
-            ),
-            details=", ".join(envs),
-            status="warning",
-        )
 
     progress_url = kwargs.pop("progress_url", None)
     progress_auth = kwargs.pop("progress_auth", None)
+    # Keep a reference so the multi-run loops (ramp / stages / input matrix) can
+    # tell it which run (run_index / run_total) is executing, for a smooth overall
+    # progress that doesn't reset between runs (see progress-design.md).
+    server_progress = (
+        ServerBenchmarkerProgress(
+            progress_url=progress_url, progress_auth=progress_auth
+        )
+        if progress_url
+        else None
+    )
     progress_chain = [
-        *(
-            [
-                ServerBenchmarkerProgress(
-                    progress_url=progress_url, progress_auth=progress_auth
-                )
-            ]
-            if progress_url
-            else []
-        ),
+        *([server_progress] if server_progress else []),
         *(
             [GenerativeConsoleBenchmarkerProgress()]
             if not disable_console_interactive
@@ -504,63 +700,175 @@ def run(**kwargs):  # noqa: C901
     ]
     progress = ChainedBenchmarkerProgress(progress_chain) if progress_chain else None
 
-    try:
-        args = BenchmarkGenerativeTextArgs.create(
-            scenario=kwargs.pop("scenario", None), **kwargs
-        )
+    # Pop project-specific args that are not guidellm args before create().
+    stages = kwargs.pop("stages", None)
+    # Auto-tune knobs (consumed by the ramp engine, never passed to guidellm).
+    auto_tune = kwargs.pop("auto_tune", False)
+    axis = kwargs.pop("axis", "rate")
+    lower_bound = kwargs.pop("lower_bound", 1.0)
+    upper_bound = kwargs.pop("upper_bound", 1024.0)
+    multiplier = kwargs.pop("multiplier", None)
+    min_requests = kwargs.pop("min_requests", 30)
+    max_points = kwargs.pop("max_points", 12)
+    max_total_seconds = kwargs.pop("max_total_seconds", 1800.0)
+    # SLA thresholds: up to 6 optional "<=" latency targets (avg + p99 of TTFT,
+    # TPOT, end-to-end latency), all in ms. Any subset may be set.
+    sla_avg_ttft_ms = kwargs.pop("sla_avg_ttft_ms", None)
+    sla_avg_tpot_ms = kwargs.pop("sla_avg_tpot_ms", None)
+    sla_p99_ttft_ms = kwargs.pop("sla_p99_ttft_ms", None)
+    sla_p99_tpot_ms = kwargs.pop("sla_p99_tpot_ms", None)
+    sla_avg_latency_ms = kwargs.pop("sla_avg_latency_ms", None)
+    sla_p99_latency_ms = kwargs.pop("sla_p99_latency_ms", None)
 
-        args.data = prepare_datasets(
-            data=args.data,
-            tokenizer=args.processor,
-            max_items=args.max_requests,
-        )
-        print(f"[DEBUG] Prepared data sources: {args.data}")
-    except ValidationError as err:
-        # Translate pydantic valdation error to click argument error
-        errs = err.errors(include_url=False, include_context=True, include_input=True)
-        param_name = "--" + str(errs[0]["loc"][0]).replace("_", "-")
-        raise click.BadParameter(
-            errs[0]["msg"], ctx=click.get_current_context(), param_hint=param_name
-        ) from err
+    def _run_once(local_kwargs):
+        try:
+            args = build_scenario_args(local_kwargs)
+        except ValidationError as err:
+            # Translate pydantic validation error to click argument error
+            errs = err.errors(
+                include_url=False, include_context=True, include_input=True
+            )
+            param_name = "--" + str(errs[0]["loc"][0]).replace("_", "-")
+            raise click.BadParameter(
+                errs[0]["msg"],
+                ctx=click.get_current_context(),
+                param_hint=param_name,
+            ) from err
 
-    # Convert string handler names to actual handler classes
-    if args.backend_kwargs and "response_handlers" in args.backend_kwargs:
-        handlers = args.backend_kwargs["response_handlers"]
-        if isinstance(handlers, dict):
-            for key, value in handlers.items():
-                if isinstance(value, str):
-                    # Look up the handler class from the factory registry
-                    handler_class = (
-                        GenerationResponseHandlerFactory.get_registered_object(value)
-                    )
-                    if handler_class:
-                        handlers[key] = handler_class
-                    else:
-                        registry = GenerationResponseHandlerFactory.registry or {}
-                        available = ", ".join(registry.keys())
-                        raise ValueError(
-                            f"Unknown response handler: '{value}'. "
-                            f"Available handlers: {available}"
-                        )
-
-    if use_error_detail_backend:
-        backend_kwargs = args.backend_kwargs or {}
-        args.backend = OpenAIHTTPErrorDetailBackend(
-            target=args.target,
-            model=args.model or "",
-            **backend_kwargs,
+        asyncio.run(
+            benchmark_generative_text(
+                args=args,
+                progress=progress,
+                console=console,
+            )
         )
-        args.backend_kwargs = None
 
     if uvloop is not None:
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    asyncio.run(
-        benchmark_generative_text(
-            args=args,
-            progress=progress,
-            console=console,
+
+    def _suffix_output(name: str, tag: str) -> str:
+        if "." in name:
+            stem, _, ext = name.rpartition(".")
+            return f"{stem}__{tag}.{ext}"
+        return f"{name}__{tag}"
+
+    def _output_base(name: str) -> str:
+        # "123.dual_json" -> "123"; the ramp writes {base}__p{index}.dual_json.
+        return name.rpartition(".")[0] if "." in name else name
+
+    if auto_tune:
+        # Adaptive ramp: one single-strategy guidellm run per probed knob point.
+        # The target (SLA boundary vs throughput saturation) is derived from
+        # whether any --sla-* is set (see AutoTuneConfig.target).
+        cfg = AutoTuneConfig(
+            axis=axis,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            multiplier=multiplier,
+            min_requests=min_requests,
+            max_points=max_points,
+            max_total_seconds=max_total_seconds,
+            sla_avg_ttft_ms=sla_avg_ttft_ms,
+            sla_avg_tpot_ms=sla_avg_tpot_ms,
+            sla_p99_ttft_ms=sla_p99_ttft_ms,
+            sla_p99_tpot_ms=sla_p99_tpot_ms,
+            sla_avg_latency_ms=sla_avg_latency_ms,
+            sla_p99_latency_ms=sla_p99_latency_ms,
+            random_seed_base=kwargs.get("random_seed", 42) or 42,
+            seed_increment=kwargs.get("seed_increment", True),
         )
-    )
+        base_outputs = list(kwargs.get("outputs") or ["benchmarks.dual_json"])
+        output_base = _output_base(base_outputs[0])
+        # Per-point kwargs share everything except profile/rate/seed/outputs/
+        # max_requests, which the ramp engine sets for each run.
+        base_kwargs = dict(kwargs)
+        for k in ("profile", "rate", "outputs", "max_requests", "max_seconds"):
+            base_kwargs.pop(k, None)
+        print(
+            f"[DEBUG] Auto-tune ramp: axis={axis} target={cfg.target} "
+            f"bounds=[{lower_bound},{upper_bound}] multiplier={cfg.resolved_multiplier} "
+            f"min_requests={min_requests} max_points={max_points} "
+            f"max_total_seconds={max_total_seconds} base={output_base}"
+        )
+        # The ramp keeps server_progress in the per-point runs so guidellm's live
+        # on_benchmark_update callbacks drive a smooth (within-point) server bar; the
+        # ramp sets run_index/run_total per point (see _prep_progress) so the bar
+        # stays proportional and never hits 100 before it explicitly finalizes.
+        points = asyncio.run(
+            run_ramp(
+                cfg=cfg,
+                base_kwargs=base_kwargs,
+                output_base=output_base,
+                server_progress=server_progress,
+                progress=progress,
+                console=console,
+            )
+        )
+        print(f"[DEBUG] Auto-tune ramp finished: {len(points)} point(s) measured")
+    elif stages:
+        # v2.1 stages: one single-rate `concurrent` run per stage, each carrying
+        # its own max_requests / max_seconds. Each writes a separate output file
+        # {base}__stage{i}.{ext}.
+        base_outputs = list(kwargs.get("outputs") or [])
+        for i, stage in enumerate(stages):
+            if server_progress is not None:
+                server_progress.run_index = i
+                server_progress.run_total = len(stages)
+            local = dict(kwargs)
+            local["profile"] = "concurrent"
+            local["rate"] = [float(stage["rate"])]
+            # Per-stage seed mirrors the ramp: increment by stage index unless the
+            # user pinned a fixed seed (only affects the Random synthetic dataset).
+            if (
+                kwargs.get("seed_increment", True)
+                and kwargs.get("random_seed") is not None
+            ):
+                local["random_seed"] = int(kwargs["random_seed"]) + i
+            if stage.get("max_requests") is not None:
+                local["max_requests"] = int(stage["max_requests"])
+            if stage.get("max_seconds") is not None:
+                local["max_seconds"] = float(stage["max_seconds"])
+            if base_outputs:
+                local["outputs"] = tuple(
+                    _suffix_output(o, f"stage{i}") for o in base_outputs
+                )
+            print(
+                f"[DEBUG] Stage run {i}: rate={stage['rate']} "
+                f"max_requests={local.get('max_requests')} "
+                f"max_seconds={local.get('max_seconds')}"
+            )
+            _run_once(local)
+    else:
+        _run_once(dict(kwargs))
+
+
+def _normalize_request_handlers(backend_kwargs: dict) -> None:
+    """Normalize a custom request-handler override to the backend's expected shape.
+
+    guidellm 0.7.1 registers request handlers on ``OpenAIRequestHandlerFactory`` by
+    API PATH. Our ``openai_http_error_detail`` backend exposes a ``request_handlers``
+    field keyed by API path -> registered handler NAME (a string) and resolves the
+    names to classes itself. We therefore keep handler names as STRINGS here.
+
+    For backward compatibility we also accept a legacy ``response_handlers`` dict
+    keyed by request_type name (e.g. "chat_completions") and translate it into the
+    path-keyed ``request_handlers`` form.
+    """
+    _REQUEST_TYPE_TO_PATH = {
+        "chat_completions": "/v1/chat/completions",
+        "text_completions": "/v1/completions",
+        "audio_transcriptions": "/v1/audio/transcriptions",
+        "audio_translations": "/v1/audio/translations",
+    }
+
+    legacy = backend_kwargs.pop("response_handlers", None)
+    if isinstance(legacy, dict):
+        request_handlers = dict(backend_kwargs.get("request_handlers") or {})
+        for key, value in legacy.items():
+            path = _REQUEST_TYPE_TO_PATH.get(key, key)
+            # Explicit request_handlers entries win on clash.
+            request_handlers.setdefault(path, value)
+        backend_kwargs["request_handlers"] = request_handlers
 
 
 @cli.command(
