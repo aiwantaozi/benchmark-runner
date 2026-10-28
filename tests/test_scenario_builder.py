@@ -1,6 +1,9 @@
 """Scenario-spec construction from benchmark-runner's flat CLI kwargs."""
 
+from unittest.mock import Mock
+
 import pytest
+from guidellm.data.tokenizers.huggingface import HuggingFaceTokenizer
 
 from benchmark_runner.scenario_builder import (
     DEFAULT_MAX_CONCURRENCY,
@@ -42,6 +45,29 @@ def base_kwargs(**extra):
         max_requests=10,
         **extra,
     )
+
+
+@pytest.mark.parametrize(
+    "processor_args",
+    [
+        None,
+        {},
+        {"trust_remote_code": True, "revision": "custom", "use_fast": False},
+        {"trust_remote_code": False},
+    ],
+)
+def test_processor_args_reach_tokenizer_loading(monkeypatch, processor_args):
+    scenario = build_scenario_args(
+        base_kwargs(processor="custom-tokenizer", processor_args=processor_args)
+    )
+    load = Mock(return_value=object())
+    monkeypatch.setattr(
+        "guidellm.data.tokenizers.huggingface.AutoTokenizer.from_pretrained", load
+    )
+
+    HuggingFaceTokenizer(scenario.spec.tokenizer)()
+
+    load.assert_called_once_with("custom-tokenizer", **(processor_args or {}))
 
 
 # Every profile the runner can emit must produce a spec guidellm accepts.

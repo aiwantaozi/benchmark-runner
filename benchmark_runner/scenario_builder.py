@@ -279,10 +279,12 @@ def build_scenario_args(kwargs: dict[str, Any]) -> BenchmarkScenario:  # noqa: C
 
     # ── Tokenizer / processor ───────────────────────────────────────────────
     processor = kwargs.pop("processor", None)
-    kwargs.pop("processor_args", None)  # no dedicated spec field in 0.7.x
+    processor_args = kwargs.pop("processor_args", None)
     tokenizer: dict[str, Any] = {"kind": "huggingface_auto"}
     if processor:
         tokenizer["model"] = processor
+    if processor_args is not None:
+        tokenizer["load_kwargs"] = processor_args
     spec["tokenizer"] = tokenizer
 
     # ── Seed (drives synthetic data + profile RNG; distinct per auto-tune pt) ─

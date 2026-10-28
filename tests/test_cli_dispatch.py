@@ -8,6 +8,9 @@ outcome lands on disk next to the point files.
 """
 
 import json
+from types import SimpleNamespace
+
+import pytest
 
 from click.testing import CliRunner
 
@@ -15,6 +18,50 @@ import benchmark_runner.main as main
 from benchmark_runner import auto_tune
 from benchmark_runner.auto_tune import RampOutcome
 from benchmark_runner.main import cli
+
+
+@pytest.mark.parametrize(
+    "mode,expected_runs",
+    [
+        ([], 1),
+        (["--stages", '[{"rate": 2}, {"rate": 4}]'], 2),
+        (["--auto-tune", "--no-probe-saturation", "--max-points", "1"], 1),
+    ],
+    ids=["single", "stages", "auto-tune"],
+)
+def test_processor_args_reach_each_run(monkeypatch, tmp_path, mode, expected_runs):
+    tokenizers = []
+
+    async def capture_run(*, args, **kwargs):
+        tokenizers.append(args.spec.tokenizer)
+        return SimpleNamespace(benchmarks=[]), None
+
+    monkeypatch.setattr(main, "benchmark_generative_text", capture_run)
+    monkeypatch.setattr(auto_tune, "benchmark_generative_text", capture_run)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "benchmark",
+            "run",
+            "--target",
+            "http://127.0.0.1:8000",
+            "--processor",
+            "custom-tokenizer",
+            "--processor-args",
+            '{"trust_remote_code": true}',
+            "--data",
+            "prompt_tokens=8,output_tokens=8",
+            "--output-dir",
+            str(tmp_path),
+            *mode,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(tokenizers) == expected_runs
+    for tokenizer in tokenizers:
+        assert tokenizer.model == "custom-tokenizer"
+        assert tokenizer.load_kwargs == {"trust_remote_code": True}
 
 
 def test_auto_tune_rejects_explicit_profile():
