@@ -57,11 +57,22 @@ Auto-tune (adaptive ramp)
 deterministic answer. It runs one single-strategy GuideLLM benchmark per measured
 point and reads the metrics back to choose the next one:
 
-- **Phase 1** — geometric bracket: double the knob until throughput stops climbing
-  (or the SLO breaks, or the server overloads).
+- **Phase 1** — geometric bracket: a throughput search doubles the knob until
+  total throughput stops climbing or request failures exceed the success floor.
+  An SLO search keeps increasing load while its latency targets and success floor
+  hold, even beyond a throughput plateau. Two consecutive increasing-load points
+  at least 15% below the highest observed total throughput trigger a protective
+  `throughput_decline` stop. A single dip or a plateau does not trigger it; recovery
+  resets the count. All counted points still meet SLO, so this stop leaves the
+  SLO boundary unlocated. Both searches respect the search range and budget.
 - **Phase 2** — for an SLO target, bisect the pass/fail bracket for the maximum knob
   still within SLO; for a throughput target, run a unimodal (ternary/golden hybrid)
-  search inside the bracket for the throughput argmax.
+  search inside the bracket for the throughput argmax. Throughput refinement also
+  converges when the running best total TPS improves by less than 1% across the
+  latest three valid new refinement points, provided valid measured loads lie on
+  both sides of the best point. Small new records do not restart this rolling
+  window. Invalid measurements reset it. This gain criterion does not apply to
+  SLO searches or geometric expansion.
 
 The **target is derived**, not configured: set any `--slo-*` threshold and the
 answer becomes "the maximum load meeting that SLO"; set none and it becomes "peak
@@ -106,13 +117,15 @@ higher); symmetrically, a server that is *already* saturated at the lower bound 
 **reported** rather than searched below — the ramp stops, and gpustack raises a
 `saturated_at_lower_bound` warning carrying the measured sustainable rate so you can
 lower the range and re-run. Defaults are 4 / 8192. The ceiling is deliberately far
-above any expected deployment: too high is free, since Phase 1 ends on saturation or
-the SLO breach first, while too low ends the run on `upper_bound` and makes the range
-end the reported answer — a number nothing measured.
+above many deployments' operating ranges, but still limits the maximum pressure
+that can be offered. A throughput search may end on saturation; an SLO search
+continues until a latency or success boundary, the range ceiling or a budget limit.
+If every measured point passes at the upper bound, the highest passing load is
+observed but a higher SLO boundary has not been located.
 
 **Budget** — `--max-points` (default 18) and `--max-total-seconds` (default 5400) cap
 the whole run. Both are ceilings, not quotas: a converged search stops early, so a
-small deployment finishes in ~6 points regardless. They are sized for the expensive
+search can finish before spending either budget. They are sized for the expensive
 case — an SLO bisection on a large deployment, which needs Phase 1's doublings plus
 log2 of the bracket width. A saturation run can be given less: its answer is an argmax
 that Phase 1 has already found, and the bisection-style narrowing buys it nothing —
@@ -161,7 +174,7 @@ than one logs which entries it ignored rather than quietly emitting only the fir
 
 ```json
 {
-  "version": 3,
+  "version": 7,
   "bracket_reason": "capacity_plateau",
   "stop_reason": "converged",
   "stopped_at": 256.0,
@@ -177,15 +190,85 @@ capacity, your search range, or the budget bounded the answer. `stop_reason` is 
 the ramp as a whole ended, Phase 2 included; the two differ whenever a bracket found
 its answer and the following search then converged normally. One of
 `slo_failed` · `capacity_plateau` · `overloaded` · `upper_bound` · `budget_points` ·
-`budget_seconds` · `converged` · `point_failed`.
+`budget_seconds` · `converged` · `throughput_gain_converged` · `point_failed` ·
+`throughput_decline`.
 
 This is reported rather than left to be inferred from the measured curve because
 several terminations leave an **identical** curve behind: a run ended by
-`--max-total-seconds` looks exactly like one that stopped of its own accord to
-anybody counting points, and a `capacity_plateau` stop under a loose SLO looks
-exactly like a threshold breaking at the top — with opposite advice attached in both
-cases. The file appears when the ramp returns, so its absence means "still running,
-or not a ramp at all"; a write failure is logged and does not fail the run.
+`--max-total-seconds` can have the same point count as one that reached a search
+bound. SLO searches report their pass/fail bracket separately; a throughput
+plateau is a stop condition only for throughput searches. The file appears when the
+ramp returns, so its absence means "still running, or not a ramp at all"; a write
+failure is logged and does not fail the run.
+
+`throughput_decline` is a protective end to SLO expansion, not an SLO failure or a
+completed latency boundary. The highest measured passing load remains the primary
+result and the failed end of `slo_bracket` stays null. The 15% / two-point policy is
+internal and does not add CLI parameters. Ramp schema v6 optionally records the
+actual trigger in `throughput_decline`:
+
+```json
+{
+  "threshold_percent": 15,
+  "consecutive_points": 2,
+  "peak_rate": 64,
+  "peak_total_tps": 10000,
+  "points": [
+    {"rate": 128, "total_tps": 8200, "drop_percent": 18},
+    {"rate": 256, "total_tps": 8000, "drop_percent": 20}
+  ]
+}
+```
+
+`rate` uses the configured load axis (concurrency or req/s), and both drops are
+relative to the recorded peak, not the preceding point. The field is omitted for
+other stop reasons. Consumers of older sidecars without this evidence can show
+the stop reason, but cannot assume the policy or trigger measurements.
+
+`throughput_gain_converged` is a normal end to peak refinement. Ramp schema v7
+records its actual rolling window in `throughput_gain_evidence`:
+
+```json
+{
+  "threshold_percent": 1,
+  "window_points": 3,
+  "baseline_rate": 64,
+  "baseline_total_tps": 3300,
+  "best_rate": 48,
+  "best_total_tps": 3320,
+  "gain_percent": 0.606061,
+  "lower_rate": 40,
+  "upper_rate": 56,
+  "points": [
+    {"rate": 48, "total_tps": 3320, "best_total_tps": 3320},
+    {"rate": 40, "total_tps": 3310, "best_total_tps": 3320},
+    {"rate": 56, "total_tps": 3315, "best_total_tps": 3320}
+  ]
+}
+```
+
+The baseline is the measured total-TPS best before the window; the gain compares
+the current best with that baseline, rather than requiring each sample to improve
+by 1%. Measurements must have at least 95% success and positive finite total TPS.
+Gain comparisons use the same six-decimal percentage as the evidence: a gain
+that rounds to 1% requires more measurements. Measured TPS values retain their
+original precision.
+The baseline and best must also be valid; an invalid measurement holding the
+global maximum prevents gain convergence. Equal total-TPS reference points use
+the lowest load, then earliest measurement. The bounds are the nearest valid
+measured loads on either side of the best, including expansion points. This
+evidence is omitted for all other stop reasons. Exhausting the integer grid still
+reports `converged`; an already satisfied gain criterion takes precedence over a
+budget that would prevent another point. The reported peak remains the highest
+measured average total TPS.
+
+The ramp sidecar records `points[].total_tps` from
+`metrics.tokens_per_second.successful.mean` independently of `output_tps`.
+Peak selection, throughput search, decline protection and TPS charts use this
+recorded total; input/output rates are auxiliary metrics, not substitutes or a
+recomputed sum. Ramp schema v5 and manual curve schema v2 include `total_tps`.
+Older output-only sidecars cannot reconstruct a total-TPS peak: offline charts
+report that total throughput was not recorded instead of treating output as total.
 
 Terminal report
 ---------------
@@ -266,10 +349,12 @@ converged or ran out of budget.
 `--disable-console` silences the report along with everything else, so a headless
 run (gpustack drives the runner this way) is unaffected.
 
-**Verdicts match the web report.** `◆ recommended` is `min(slo_met, peak)` and
-`✕ overloaded` means a failure rate over 5% *or* a point past the peak delivering
-under 95% of it — the same rules the GPUStack UI badges each stage with. A point
-one step past the knee at ~peak throughput is deliberately NOT overload; it is
+**The primary result follows the search objective.** `◆ recommended` identifies
+the highest measured load meeting the SLO, or the measured total-TPS peak
+when no SLO is set. An unmet SLO has no primary point. A different total-TPS peak is
+reported separately. `✕ overloaded` means a failure rate over 5% *or* a point past
+the peak delivering under 95% of it. A point one step past the knee at ~peak
+throughput is deliberately NOT overload; it is
 often the true argmax.
 
 **It degrades rather than breaks.** Colour is added only on a TTY (and never

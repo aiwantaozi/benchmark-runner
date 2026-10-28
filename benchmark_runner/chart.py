@@ -223,7 +223,7 @@ def point_status(
     declining = (
         past_peak
         and peak_tps > 0
-        and _num(point, "output_tps") < peak_tps * DECLINE_RATIO
+        and _num(point, "total_tps") < peak_tps * DECLINE_RATIO
     )
     if fail_rate > (1.0 - SUCCESS_FLOOR) or declining:
         return STATUS_OVERLOADED
@@ -237,11 +237,10 @@ def best_points(
     slo_met_knob: Optional[float],
     target: str = "saturation",
 ) -> dict:
-    """Peak / recommended knobs, using gpustack's ``compute_best_points`` rule.
+    """Measured total-TPS peak and the primary result's load.
 
-    ``recommended = min(slo_met_knob, peak)`` when an SLO was set, else the peak.
-    Capped AT the peak rather than below it: up to the peak more load buys more
-    throughput, so an SLO that still holds there makes the peak the answer.
+    The SLO answer is the highest measured passing load, regardless of where
+    throughput peaks. Without an SLO, the primary result is the total-TPS peak.
 
     ``target="stages"`` yields NO recommendation. A ladder is a list of rungs the
     user chose, so its argmax is "the best of what you measured", not "the load to
@@ -249,15 +248,20 @@ def best_points(
     which is precisely what a stage list does not verify. Reporting the peak as a
     recommendation would launder the user's own guess into a finding.
     """
-    if not points:
-        return {"peak_knob": None, "peak_tps": 0.0, "recommended_knob": None}
-    peak = max(points, key=lambda p: _num(p, "output_tps"))
-    peak_knob = _num(peak, "knob")
-    peak_tps = _num(peak, "output_tps")
+    recorded = [point for point in points if point.get("total_tps") is not None]
+    peak = max(
+        recorded,
+        key=lambda p: (_num(p, "total_tps"), -_num(p, "knob")),
+        default=None,
+    )
+    peak_knob = _num(peak, "knob") if peak is not None else None
+    peak_tps = _num(peak, "total_tps") if peak is not None else 0.0
     if target == "stages":
         recommended = None
     elif slo_met_knob is not None:
-        recommended = min(float(slo_met_knob), peak_knob)
+        recommended = float(slo_met_knob)
+    elif target == "slo":
+        recommended = None
     else:
         recommended = peak_knob
     return {
@@ -592,7 +596,13 @@ def render_curve_report(
     )
     out.append("")
 
-    charts = mode != CHART_NONE and len(ordered) > 1
+    total_available = all(point.get("total_tps") is not None for point in ordered)
+    charts = mode != CHART_NONE and len(ordered) > 1 and total_available
+    if not total_available:
+        out.append(
+            "  Total throughput was not recorded for every point; total-TPS charts unavailable."
+        )
+        out.append("")
     if charts:
         out += _headline_charts(ordered, statuses, axis, slo_thresholds, style)
         if mode == CHART_ALL:
@@ -600,7 +610,7 @@ def render_curve_report(
         out.append("")
         out.append("  " + _legend(statuses, style))
         out.append("")
-    elif mode != CHART_NONE:
+    elif mode != CHART_NONE and len(ordered) == 1:
         out.append(
             "  "
             + style.paint(
@@ -656,7 +666,7 @@ def _headline_charts(
     latency did at the same load" — is a vertical comparison anyway.
     """
     cols = _columns(len(points), style.width)
-    tps = Series([_num(p, "output_tps") for p in points], statuses)
+    tps = Series([_num(p, "total_tps") for p in points], statuses)
     out = _panel(
         "total throughput (tok/s)",
         [tps],
@@ -753,7 +763,7 @@ def _secondary_charts(
         )
 
     out.append("")
-    tps = [_num(p, "output_tps") for p in points]
+    tps = [_num(p, "total_tps") for p in points]
     ttft = [_num(p, "ttft_p99_ms") or _num(p, "ttft_ms") for p in points]
     lo, hi = min(tps), max(tps)
     span = (hi - lo) or 1.0
@@ -807,7 +817,7 @@ def _table(
     caused it, which is what someone pastes into a ticket.
     """
     _, knob_header, _ = _axis_names(axis)
-    peak_tps = max((_num(p, "output_tps") for p in points), default=0.0) or 1.0
+    peak_tps = max((_num(p, "total_tps") for p in points), default=0.0) or 1.0
     header = (
         f"   {knob_header:>7} {'achieved':>9} {'TTFT p99':>10} {'ITL':>9} "
         f"{'tok/s':>10}  {'':<18} {'ok':>5}"
@@ -816,14 +826,16 @@ def _table(
     out = [f"  {style.paint(header, 'dim')}", "  " + style.paint(ruler, "dim")]
     for point, status in zip(points, statuses):
         glyph = style.glyphs[status] if status != STATUS_OK else " "
-        tps = _num(point, "output_tps")
-        bar = style.text["bar"] * round(tps / peak_tps * 18)
+        tps = _num(point, "total_tps")
+        recorded = point.get("total_tps") is not None
+        bar = style.text["bar"] * round(tps / peak_tps * 18) if recorded else ""
+        tps_label = f"{tps:,.0f}" if recorded else "-"
         row = (
             f" {style.paint(glyph, status)} {_fmt_knob(_num(point, 'knob')):>7} "
             f"{_num(point, 'achieved_rate'):>9.1f} "
             f"{_fmt_ms(_num(point, 'ttft_p99_ms') or _num(point, 'ttft_ms')):>10} "
             f"{_fmt_ms_precise(_itl_of(point)):>9} "
-            f"{tps:>10,.0f}  {bar:<18} {_num(point, 'success') * 100:>4.0f}%"
+            f"{tps_label:>10}  {bar:<18} {_num(point, 'success') * 100:>4.0f}%"
         )
         out.append(f"  {row}")
     return out
@@ -862,14 +874,26 @@ def _verdict(  # noqa: C901 - one sentence per mode; a dispatch table hides the 
             chosen = point
             break
     if chosen is None:
+        if target == "slo":
+            out = [f"  SLO met by no measured point {dash} no primary result"]
+            if stop_reason:
+                out.append(f"    stopped: {stop_reason}")
+            return out
+        if best["peak_knob"] is None:
+            return ["  Total throughput was not recorded; total-TPS peak unavailable."]
         return []
 
     glyph = style.paint(style.glyphs[lead_status], lead_status)
     knob = _fmt_knob(_num(chosen, "knob"))
     label = "Best of the stages you ran" if ladder else "Recommended"
+    throughput = (
+        f"{_num(chosen, 'total_tps'):,.0f}"
+        if chosen.get("total_tps") is not None
+        else "-"
+    )
     headline = (
         f"{glyph} {label}: {style.paint(knob + ' ' + unit, 'bold')}"
-        f"  {style.text['arrow']}  {_num(chosen, 'output_tps'):,.0f} tok/s"
+        f"  {style.text['arrow']}  {throughput} tok/s"
     )
     out = [f"  {headline}"]
     out.append(
@@ -883,6 +907,11 @@ def _verdict(  # noqa: C901 - one sentence per mode; a dispatch table hides the 
         if slo_met_knob is None:
             note = (
                 f"SLO met by no measured point {dash} every point breached a threshold"
+            )
+        elif stop_reason == "throughput_decline" and slo_first_fail_knob is None:
+            note = (
+                f"Protective stop: sustained total-throughput decline {dash} "
+                "SLO boundary not located; this is the highest measured passing load"
             )
         elif slo_first_fail_knob is None:
             note = (
@@ -900,11 +929,16 @@ def _verdict(  # noqa: C901 - one sentence per mode; a dispatch table hides the 
             out.append(
                 "    "
                 + style.paint(
-                    f"throughput peaks higher, at {_fmt_knob(best['peak_knob'])} {unit} "
-                    f"({best['peak_tps']:,.0f} tok/s) {dash} capped here by the SLO",
+                    f"Measured total-TPS peak: {_fmt_knob(best['peak_knob'])} {unit} "
+                    f"({best['peak_tps']:,.0f} tok/s)",
                     "dim",
                 )
             )
+    elif stop_reason == "throughput_gain_converged":
+        out.append(
+            "    "
+            + style.paint("Peak refinement converged on total-throughput gain.", "dim")
+        )
 
     if ladder:
         coverage = _ladder_coverage(points, chosen, unit, dash)

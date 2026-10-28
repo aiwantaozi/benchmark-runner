@@ -53,6 +53,13 @@ from benchmark_runner.scenario_builder import (
 SUCCESS_FLOOR = 0.95
 # Throughput plateau threshold: <5% gain over previous point = saturated.
 PLATEAU_GAIN = 0.05
+# SLO expansion may stop protectively after sustained, substantial total-throughput loss.
+# A plateau or a single low sample does not establish this condition.
+SLO_THROUGHPUT_DROP_RATIO = 0.15
+SLO_THROUGHPUT_DROP_POINTS = 2
+# Peak refinement compares the running total-TPS best across a rolling window.
+THROUGHPUT_GAIN_RATIO = 0.01
+THROUGHPUT_GAIN_POINTS = 3
 # Max concurrency cap for the saturation probe so an unbounded offered load can't
 # pile up in-flight requests and drag the server down — which would bias the very
 # ceiling the probe is measuring. Re-exported from the scenario builder, which
@@ -65,16 +72,12 @@ DEFAULT_RATE_MAX_CONCURRENCY = DEFAULT_MAX_CONCURRENCY
 # measured curve: several of these terminations produce IDENTICAL grids, so the
 # reader cannot tell them apart afterwards.
 #
-# Two concrete cases that motivated reporting it:
-#   * SLO target, thresholds never breached. `capacity_plateau` (we stopped
-#     because throughput flattened) and `slo_failed`-at-the-top look the same in
-#     rate space — both end with "the highest knob measured met the SLO".
-#   * `budget_seconds` vs `budget_points`. A consumer counting points can only see
-#     the second one; a run cut short by the time cap looks exactly like a run
-#     that stopped of its own accord, and the advice for the two is different
-#     (raise the duration cap vs. nothing to fix).
+# Range limits, measurement budgets and measured failures leave different limits
+# on the answer. Report the termination itself rather than infer it from a curve
+# whose throughput may already have flattened before a latency target breaks.
 STOP_SLO_FAILED = "slo_failed"  # a point breached the SLO -> bracket found
 STOP_CAPACITY_PLATEAU = "capacity_plateau"  # throughput stopped climbing
+STOP_THROUGHPUT_DECLINE = "throughput_decline"  # protective stop; SLO may still pass
 STOP_OVERLOADED = "overloaded"  # success rate fell under the floor
 STOP_UPPER_BOUND = "upper_bound"  # reached the top of the search range
 # Reached the probe's soft cap with no measured point to overrule it — only
@@ -85,6 +88,7 @@ STOP_PROBE_BOUND = "probe_bound"
 STOP_BUDGET_POINTS = "budget_points"  # max_points spent
 STOP_BUDGET_SECONDS = "budget_seconds"  # max_total_seconds spent
 STOP_CONVERGED = "converged"  # the search interval closed
+STOP_THROUGHPUT_GAIN_CONVERGED = "throughput_gain_converged"
 STOP_POINT_FAILED = "point_failed"  # a point produced no benchmark
 
 # Schema version of the ramp outcome, so a consumer reading an older sidecar can
@@ -110,7 +114,13 @@ STOP_POINT_FAILED = "point_failed"  # a point produced no benchmark
 # Also NOT additive, for the same reason as v3. `chart` reads the old spelling as
 # a fallback, so a v3 sidecar still renders; gpustack is unaffected — it reads
 # stop_reason / stopped_at / probe_* from here and nothing else.
-RAMP_OUTCOME_VERSION = 4
+# Total TPS is recorded independently from output TPS so peak searches, guards
+# and offline charts use the same measured quantity. Output-only sidecars cannot
+# reconstruct a total-TPS peak.
+# Protective-stop evidence records the policy and measured reference at the stop,
+# so consumers can explain it without assuming their current policy applied.
+# Peak refinement records the measured window and coverage behind gain convergence.
+RAMP_OUTCOME_VERSION = 7
 
 # The version that first carried ``points``. Named separately from the current
 # version because it is the floor a chartable sidecar has to clear, and the two
@@ -175,6 +185,7 @@ class PointMetrics:
     knob: float
     index: int
     output_tps: float  # metrics.output_tokens_per_second.successful.mean
+    total_tps: float  # metrics.tokens_per_second.successful.mean; search objective
     ttft_ms: float  # metrics.time_to_first_token_ms.successful.mean
     ttft_p95_ms: float  # ...time_to_first_token_ms.successful.percentiles.p95
     ttft_p99_ms: float  # ...time_to_first_token_ms.successful.percentiles.p99
@@ -224,13 +235,10 @@ class AutoTuneConfig:
     # points; raising it further is the one knob here with a cliff, since a floor
     # above the SLO boundary fails the FIRST point and leaves no bracket at all.
     #
-    # The ceiling is 8192 rather than 1024 because the two directions are not
-    # symmetric. Too high costs nothing — Phase 1 ends on capacity_plateau or the
-    # SLO breach, so a small deployment never reaches it (measured: identical point
-    # count and wall clock at 1024 through 8192 for peaks up to 1024). Too low ends
-    # the run on `upper_bound` and reports the range end as the peak/boundary, i.e.
-    # a number nothing measured: at 1024 a 4096-concurrency deployment reported
-    # 4096 against a true boundary of 5612, and no point budget could fix it.
+    # The upper bound caps the offered load. Throughput searches can finish on a
+    # plateau; SLO searches continue while every latency target and the success
+    # floor hold, even when throughput has stopped increasing. Both remain bounded
+    # by the point and time budgets.
     lower_bound: float = 4.0
     upper_bound: float = 8192.0
     multiplier: Optional[float] = None  # default resolved by axis (10 conc / 30 rate)
@@ -394,10 +402,13 @@ class RampOutcome:
     # threshold line cannot show how much headroom the chosen point had. None
     # entries are dropped, so an empty dict means "saturation target".
     slo_thresholds: Optional[dict[str, float]] = None
+    # Actual trigger measurements; absent when the decline guard did not stop the run.
+    throughput_decline: Optional[dict[str, Any]] = None
+    throughput_gain_evidence: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serializable facts, including the measured grid (see the version note)."""
-        return {
+        facts = {
             "version": RAMP_OUTCOME_VERSION,
             "points": [asdict(p) for p in self.points],
             "bracket_reason": self.bracket_reason,
@@ -419,6 +430,14 @@ class RampOutcome:
             "probe_bound": self.probe_bound,
             "slo_thresholds": self.slo_thresholds or {},
         }
+        if self.throughput_decline is not None:
+            facts["throughput_decline"] = self.throughput_decline
+        if (
+            self.stop_reason == STOP_THROUGHPUT_GAIN_CONVERGED
+            and self.throughput_gain_evidence is not None
+        ):
+            facts["throughput_gain_evidence"] = self.throughput_gain_evidence
+        return facts
 
 
 def _mean(node: Any, *path: str) -> float:
@@ -446,6 +465,7 @@ def _normalize(benchmark: Any, knob: float, index: int) -> PointMetrics:
         knob=knob,
         index=index,
         output_tps=_mean(m, "output_tokens_per_second", "successful", "mean"),
+        total_tps=_mean(m, "tokens_per_second", "successful", "mean"),
         ttft_ms=_mean(m, "time_to_first_token_ms", "successful", "mean"),
         ttft_p95_ms=_mean(
             m, "time_to_first_token_ms", "successful", "percentiles", "p95"
@@ -511,7 +531,7 @@ def _capacity_saturated(
 
     Two signals, either one is enough:
 
-    * ``plateau`` — output token throughput stopped climbing (<5% over the previous
+    * ``plateau`` — total token throughput stopped climbing (<5% over the previous
       point). Applies to both axes: it is the quantity the whole sweep is about.
     * ``cant_keepup`` — the ACHIEVED request rate stopped climbing. Rate axis only,
       where the knob IS an offered rate. Note this is a growth comparison between
@@ -520,11 +540,9 @@ def _capacity_saturated(
       offered (achieved ~= offered / (1 + latency/window)) even on an idle server,
       so an absolute floor false-trips on the very first, unsaturated point.
 
-    Both targets use this, for different reasons. For the saturation target it IS
-    the stop criterion (the peak is here). For the SLO target it is a SECONDARY
-    stop: the SLO may still hold far past this point, but past saturation more load
-    buys no more work — only queueing — so a "capacity" answer taken from up there
-    is a load nobody would ever choose to run at. See the Phase-1 SLO branch.
+    This is a stop criterion for throughput searches. Flat throughput does not
+    establish an SLO boundary; SLO expansion instead has a separate protective
+    stop for sustained significant total-throughput loss.
     """
     cant_keepup = (
         axis == "rate"
@@ -535,9 +553,63 @@ def _capacity_saturated(
     plateau = (
         prev_tps is not None
         and prev_tps > 0
-        and (m.output_tps / prev_tps - 1.0) < PLATEAU_GAIN
+        and (m.total_tps / prev_tps - 1.0) < PLATEAU_GAIN
     )
     return cant_keepup or plateau
+
+
+def _valid_throughput_point(point: PointMetrics) -> bool:
+    """Whether a measurement can establish throughput gain or peak coverage."""
+    return (
+        point.success >= SUCCESS_FLOOR
+        and math.isfinite(point.total_tps)
+        and point.total_tps > 0
+    )
+
+
+def _throughput_best(points: list[PointMetrics]) -> PointMetrics:
+    """Reference the lowest-load, earliest measurement at the observed total peak."""
+    return max(points, key=lambda point: (point.total_tps, -point.knob, -point.index))
+
+
+def _throughput_gain_evidence(
+    points: list[PointMetrics],
+    window: list[tuple[PointMetrics, PointMetrics]],
+) -> Optional[dict[str, Any]]:
+    """Explain a low-gain refinement window with valid samples around its best."""
+    if len(window) != THROUGHPUT_GAIN_POINTS:
+        return None
+    baseline = window[0][0]
+    best = _throughput_best(points)
+    if not _valid_throughput_point(baseline) or not _valid_throughput_point(best):
+        return None
+    gain_percent = round((best.total_tps / baseline.total_tps - 1.0) * 100, 6)
+    if gain_percent >= THROUGHPUT_GAIN_RATIO * 100:
+        return None
+    rates = [point.knob for point in points if _valid_throughput_point(point)]
+    lower = max((rate for rate in rates if rate < best.knob), default=None)
+    upper = min((rate for rate in rates if rate > best.knob), default=None)
+    if lower is None or upper is None:
+        return None
+    return {
+        "threshold_percent": THROUGHPUT_GAIN_RATIO * 100,
+        "window_points": THROUGHPUT_GAIN_POINTS,
+        "baseline_rate": baseline.knob,
+        "baseline_total_tps": baseline.total_tps,
+        "best_rate": best.knob,
+        "best_total_tps": best.total_tps,
+        "gain_percent": gain_percent,
+        "lower_rate": lower,
+        "upper_rate": upper,
+        "points": [
+            {
+                "rate": point.knob,
+                "total_tps": point.total_tps,
+                "best_total_tps": max(before.total_tps, point.total_tps),
+            }
+            for before, point in window
+        ],
+    }
 
 
 # A run_point callable executes ONE measured point for (knob, index) and returns
@@ -697,6 +769,10 @@ async def run_ramp(  # noqa: C901
     prev_knob: Optional[float] = None  # last knob whose tps still improved
     prev_prev_knob: Optional[float] = None  # the geometric point before prev_knob
     last_pass: Optional[float] = None
+    slo_peak_tps = 0.0
+    slo_decline_points = 0
+    decline_evidence: Optional[dict[str, Any]] = None
+    gain_evidence: Optional[dict[str, Any]] = None
     first_fail: Optional[float] = None
     # Saturation bracket for the Phase-2 peak search: (lo, hi) where lo is the
     # last still-improving knob (holds the running-best tps) and hi is the knob
@@ -821,32 +897,43 @@ async def run_ramp(  # noqa: C901
         if cfg.target == "slo":
             if _passes_slo(m, cfg):
                 last_pass = knob
-                # SECONDARY termination: the SLO still holds, but the server has
-                # stopped converting more load into more delivered work. Without
-                # this the SLO branch has NO saturation criterion at all (only the
-                # 95% success floor inside _passes_slo), so a threshold set loosely
-                # enough never to break lets the ramp double all the way to
-                # upper_bound through the saturated region — measuring points that
-                # deliver LESS throughput at an order of magnitude worse latency,
-                # and then reporting the top of the range as the "SLO capacity".
-                # Observed on a real run: throughput peaked at 256 streams
-                # (TTFT 142ms) yet the answer came back 1024 (TTFT 5809ms, 6% LESS
-                # throughput) because a 10s TTFT threshold was never violated.
-                #
-                # Deliberately NOT treated as an SLO failure: writing first_fail
-                # here would make Phase 2 bisect (last_pass, saturation_knob) and
-                # return a SATURATION point dressed up as a latency boundary. The
-                # honest statement is "the SLO never bound this sweep; capacity
-                # did", which the aggregation side reports as `slo_not_binding`
-                # (and takes the throughput peak as the operating point).
-                if _capacity_saturated(m, prev_tps, prev_achieved, cfg.axis):
-                    bracket_reason = STOP_CAPACITY_PLATEAU
+                slo_peak_tps = max(slo_peak_tps, m.total_tps)
+                if slo_peak_tps > 0 and m.total_tps <= slo_peak_tps * (
+                    1.0 - SLO_THROUGHPUT_DROP_RATIO
+                ):
+                    slo_decline_points += 1
+                else:
+                    slo_decline_points = 0
+                if slo_decline_points >= SLO_THROUGHPUT_DROP_POINTS:
+                    # Every counted point still passes SLO. Preserve last_pass
+                    # and leave first_fail unset: no latency boundary was found.
+                    peak = max(points, key=lambda p: p.total_tps)
+                    decline_evidence = {
+                        "threshold_percent": SLO_THROUGHPUT_DROP_RATIO * 100,
+                        "consecutive_points": SLO_THROUGHPUT_DROP_POINTS,
+                        "peak_rate": peak.knob,
+                        "peak_total_tps": peak.total_tps,
+                        "points": [
+                            {
+                                "rate": p.knob,
+                                "total_tps": p.total_tps,
+                                "drop_percent": round(
+                                    100
+                                    * (peak.total_tps - p.total_tps)
+                                    / peak.total_tps,
+                                    6,
+                                ),
+                            }
+                            for p in points[-SLO_THROUGHPUT_DROP_POINTS:]
+                        ],
+                    }
+                    bracket_reason = STOP_THROUGHPUT_DECLINE
                     break
+                # A throughput plateau alone does not violate the SLO or confirm
+                # a decline. Continue expansion within the range and budgets.
                 if knob >= cfg.upper_bound:
                     bracket_reason = STOP_UPPER_BOUND
                     break
-                prev_tps = m.output_tps
-                prev_achieved = m.achieved_rate
                 # Clamped for the same reason as the saturation branch: an
                 # unclamped doubling would measure a load OUTSIDE the range the
                 # user asked for.
@@ -890,7 +977,7 @@ async def run_ramp(  # noqa: C901
                     )
                     sat_bracket = (lo, knob)
                 break
-            prev_tps = m.output_tps
+            prev_tps = m.total_tps
             prev_achieved = m.achieved_rate
             prev_prev_knob = prev_knob
             prev_knob = knob
@@ -1023,19 +1110,26 @@ async def run_ramp(  # noqa: C901
     if cfg.target == "saturation" and sat_bracket is not None:
         a, c = sat_bracket
         b = prev_knob if prev_knob is not None else a
-        tps_by_knob = {p.knob: p.output_tps for p in points}
+        tps_by_knob = {p.knob: p.total_tps for p in points}
         fb = tps_by_knob.get(b, prev_tps if prev_tps is not None else -1.0)
         measured = set(tps_by_knob)
+        gain_window: list[tuple[PointMetrics, PointMetrics]] = []
 
         async def _probe_point(x: float) -> Optional[float]:
             _prep_progress(len(points), _phase2_remaining(a, c))
+            before = _throughput_best(points)
             m = await _run_point(x, len(points))
             if m is None:
                 return None
             points.append(m)
-            tps_by_knob[x] = m.output_tps
+            tps_by_knob[x] = m.total_tps
             measured.add(x)
-            return m.output_tps
+            if _valid_throughput_point(m):
+                gain_window.append((before, m))
+                del gain_window[:-THROUGHPUT_GAIN_POINTS]
+            else:
+                gain_window.clear()
+            return m.total_tps
 
         stop_reason = STOP_CONVERGED
         # Budget checked after a next point is established — see the SLO bisection
@@ -1056,6 +1150,10 @@ async def run_ramp(  # noqa: C901
                 use_left = False
             else:
                 break  # integer grid exhausted on both sides -> converged
+            gain_evidence = _throughput_gain_evidence(points, gain_window)
+            if gain_evidence is not None:
+                stop_reason = STOP_THROUGHPUT_GAIN_CONVERGED
+                break
             if (spent := _budget_reason(len(points))) is not None:
                 stop_reason = spent
                 break
@@ -1111,6 +1209,8 @@ async def run_ramp(  # noqa: C901
         probe_relaxed=probe_relaxed,
         probe_bound=saturation_bound,
         slo_thresholds=cfg.set_thresholds(),
+        throughput_decline=decline_evidence,
+        throughput_gain_evidence=gain_evidence,
     )
 
 

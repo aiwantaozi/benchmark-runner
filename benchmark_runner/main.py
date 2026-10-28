@@ -89,7 +89,7 @@ RAMP_OUTCOME_SUFFIX = "__ramp.json"
 CURVE_OUTCOME_SUFFIX = "__curve.json"
 # Bumped independently of RAMP_OUTCOME_VERSION — these are two schemas that happen
 # to share a renderer, not one schema with two writers.
-CURVE_OUTCOME_VERSION = 1
+CURVE_OUTCOME_VERSION = 2
 
 
 def _finish_stages(
@@ -490,12 +490,12 @@ def benchmark():
     "upper_bound",
     type=float,
     default=8192.0,
-    help="Auto-tune knob upper bound: hard ceiling (anti-runaway). Hitting it "
-    "while throughput still climbs stops the ramp and makes the range end the "
-    "reported answer, so prefer it too high over too low — Phase 1 ends on "
-    "saturation or the SLO breach well before the ceiling on all but the largest "
-    "deployments. The saturation probe's soft cap can only tighten below it, "
-    "never override it.",
+    help="Auto-tune knob upper bound: hard ceiling on offered load. Throughput "
+    "searches can stop on saturation; SLO searches continue while latency targets "
+    "and request success pass, even when throughput plateaus, with a protective "
+    "stop for sustained significant total-throughput decline. Set a practical "
+    "bound: a loose SLO can reach it or exhaust the budget without locating a "
+    "boundary. The saturation probe's soft cap never overrides this ceiling.",
 )
 @click.option(
     "--multiplier",

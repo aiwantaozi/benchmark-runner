@@ -59,6 +59,7 @@ def make_metrics(
         knob=knob,
         index=index,
         output_tps=tps,
+        total_tps=tps,
         ttft_ms=ttft,
         ttft_p95_ms=ttft,
         ttft_p99_ms=ttft,
@@ -159,11 +160,11 @@ def knobs(points):
 
 
 def peak_knob(points):
-    return max(points, key=lambda p: p.output_tps).knob
+    return max(points, key=lambda p: p.total_tps).knob
 
 
 def peak_tps(points):
-    return max(p.output_tps for p in points)
+    return max(p.total_tps for p in points)
 
 
 # ── saturation: Phase-1 stop + bracket ───────────────────────────────────────
@@ -217,6 +218,207 @@ def test_peak_exactly_on_sampled_point():
     pts = run(sat_cfg(), make_run_point(curve))
     assert peak_knob(pts) == 32.0
     assert peak_tps(pts) >= 3200 - 1
+
+
+class TestThroughputGainConvergence:
+    """Peak refinement ends when three new points buy less than 1% total TPS."""
+
+    @staticmethod
+    def outcome(refinement=(3320, 3310, 3315), mutate=None, **config):
+        async def measure(knob, index):
+            if index < 3:
+                tps = (1600, 3200, 3300)[index]
+            else:
+                tps = refinement[min(index - 3, len(refinement) - 1)]
+            point = make_metrics(knob, index, tps)
+            if mutate is not None:
+                mutate(point)
+            return point
+
+        cfg = dict(lower_bound=16, upper_bound=128, max_points=20)
+        cfg.update(config)
+        return run_outcome(sat_cfg(**cfg), measure)
+
+    def test_three_low_gain_points_record_the_window_and_nearest_neighbors(self):
+        outcome = self.outcome()
+
+        assert knobs(outcome.points) == [16, 32, 64, 48, 40, 56]
+        assert outcome.bracket_reason == STOP_CAPACITY_PLATEAU
+        assert outcome.stop_reason == "throughput_gain_converged"
+        assert peak_knob(outcome.points) == 48
+        evidence = outcome.to_dict()["throughput_gain_evidence"]
+        assert evidence == {
+            "threshold_percent": 1,
+            "window_points": 3,
+            "baseline_rate": 64,
+            "baseline_total_tps": 3300,
+            "best_rate": 48,
+            "best_total_tps": 3320,
+            "gain_percent": pytest.approx(100 * (3320 / 3300 - 1)),
+            "lower_rate": 40,
+            "upper_rate": 56,
+            "points": [
+                {"rate": 48, "total_tps": 3320, "best_total_tps": 3320},
+                {"rate": 40, "total_tps": 3310, "best_total_tps": 3320},
+                {"rate": 56, "total_tps": 3315, "best_total_tps": 3320},
+            ],
+        }
+        assert outcome.to_dict()["version"] == 7
+        assert "throughput_decline" not in outcome.to_dict()
+
+    def test_small_new_records_do_not_restart_the_window(self):
+        outcome = self.outcome((3305, 3310, 3315))
+
+        assert len(outcome.points) == 6
+        assert outcome.stop_reason == "throughput_gain_converged"
+        assert outcome.throughput_gain_evidence["baseline_total_tps"] == 3300
+
+    def test_equal_total_tps_uses_the_lowest_rate_for_the_evidence_best(self):
+        outcome = self.outcome((3300, 3290, 3295))
+
+        assert outcome.stop_reason == "throughput_gain_converged"
+        assert len(outcome.points) == 6
+        evidence = outcome.throughput_gain_evidence
+        assert evidence["baseline_rate"] == 64
+        assert evidence["best_rate"] == 48
+        assert evidence["lower_rate"] == 40
+        assert evidence["upper_rate"] == 56
+
+    def test_the_window_baseline_uses_the_same_lowest_rate_tie_break(self):
+        def mutate(point):
+            if point.index == 1:
+                point.total_tps = 3300
+
+        outcome = self.outcome((3300, 3300, 3300), mutate=mutate)
+
+        assert outcome.stop_reason == "throughput_gain_converged"
+        assert outcome.throughput_gain_evidence["baseline_rate"] == 32
+        assert outcome.throughput_gain_evidence["best_rate"] == 24
+
+    @pytest.mark.parametrize("gain", [0.01, 0.015])
+    def test_material_cumulative_gain_requires_more_measurements(self, gain):
+        refinement = tuple(3300 * (1 + gain * step / 3) for step in (1, 2, 3))
+        outcome = self.outcome(refinement, max_points=6)
+
+        assert len(outcome.points) == 6
+        assert outcome.stop_reason == STOP_BUDGET_POINTS
+        assert "throughput_gain_evidence" not in outcome.to_dict()
+
+    @pytest.mark.parametrize(
+        ("gain_percent", "stop_reason"),
+        [(0.9999994, "throughput_gain_converged"), (0.9999996, STOP_BUDGET_POINTS)],
+    )
+    def test_gain_decisions_use_the_recorded_percentage_precision(
+        self, gain_percent, stop_reason
+    ):
+        refinement = tuple(
+            3300 * (1 + gain_percent / 100 * step / 3) for step in (1, 2, 3)
+        )
+        outcome = self.outcome(refinement, max_points=6)
+
+        assert outcome.stop_reason == stop_reason
+        assert outcome.points[-1].total_tps == refinement[-1]
+        evidence = outcome.to_dict().get("throughput_gain_evidence")
+        if evidence is not None:
+            assert evidence["gain_percent"] == 0.999999
+            assert evidence["gain_percent"] < evidence["threshold_percent"]
+
+    def test_an_exact_one_percent_gain_is_not_below_the_threshold(self):
+        def mutate(point):
+            if point.index < 3:
+                point.total_tps = (0.03, 0.068, 0.07)[point.index]
+
+        outcome = self.outcome((0.0702, 0.0704, 0.0707), mutate=mutate, max_points=6)
+
+        assert outcome.stop_reason == STOP_BUDGET_POINTS
+        assert outcome.points[-1].total_tps == 0.0707
+        assert "throughput_gain_evidence" not in outcome.to_dict()
+
+    @pytest.mark.parametrize("peak_side", ["lower", "upper"])
+    def test_a_best_point_at_a_measured_boundary_is_not_gain_converged(self, peak_side):
+        curve = (
+            (lambda knob: 10000 - knob)
+            if peak_side == "lower"
+            else piecewise({16: 1600, 32: 3200, 64: 6400, 128: 6500})
+        )
+        outcome = run_outcome(
+            sat_cfg(lower_bound=16, upper_bound=128, max_points=20),
+            make_run_point(curve),
+        )
+
+        assert outcome.stop_reason != "throughput_gain_converged"
+        assert "throughput_gain_evidence" not in outcome.to_dict()
+
+    @pytest.mark.parametrize("bad", ["success", "zero", "negative", "nan"])
+    def test_an_invalid_refinement_resets_the_three_point_window(self, bad):
+        def mutate(point):
+            if point.index == 4:
+                if bad == "success":
+                    point.success = 0.9
+                else:
+                    point.total_tps = {"zero": 0, "negative": -1, "nan": math.nan}[bad]
+
+        outcome = self.outcome(mutate=mutate)
+
+        assert len(outcome.points) == 8
+        assert outcome.stop_reason == "throughput_gain_converged"
+        evidence = outcome.throughput_gain_evidence
+        assert [p["rate"] for p in evidence["points"]] == [56, 44, 52]
+        assert evidence["baseline_rate"] == 48
+
+    @pytest.mark.parametrize("bad", ["success", "infinity"])
+    def test_an_invalid_global_best_cannot_establish_gain_convergence(self, bad):
+        def mutate(point):
+            if point.index == 3:
+                point.total_tps = 4000 if bad == "success" else math.inf
+                if bad == "success":
+                    point.success = 0.9
+
+        outcome = self.outcome(mutate=mutate)
+
+        assert outcome.stop_reason != "throughput_gain_converged"
+        assert "throughput_gain_evidence" not in outcome.to_dict()
+
+    def test_output_growth_does_not_extend_a_total_tps_plateau(self):
+        def mutate(point):
+            point.output_tps = 100 * 2**point.index
+
+        outcome = self.outcome(mutate=mutate)
+
+        assert outcome.stop_reason == "throughput_gain_converged"
+        assert len(outcome.points) == 6
+        assert peak_knob(outcome.points) == 48
+
+    def test_the_third_low_gain_point_can_complete_the_point_budget(self):
+        outcome = self.outcome(max_points=6)
+
+        assert len(outcome.points) == 6
+        assert outcome.stop_reason == "throughput_gain_converged"
+
+    def test_the_third_low_gain_point_can_complete_the_time_budget(self, monkeypatch):
+        import benchmark_runner.auto_tune as at
+
+        clock = [0.0]
+        monkeypatch.setattr(at.time, "monotonic", lambda: clock[0])
+
+        def mutate(point):
+            if point.index == 5:
+                clock[0] = 10
+
+        outcome = self.outcome(mutate=mutate, max_total_seconds=10)
+
+        assert outcome.stop_reason == "throughput_gain_converged"
+        assert len(outcome.points) == 6
+
+    def test_an_exhausted_integer_grid_keeps_exact_convergence(self):
+        curve = piecewise({2: 1600, 3: 3280, 4: 3300, 5: 3280, 6: 3280, 8: 3290})
+        outcome = run_outcome(
+            sat_cfg(lower_bound=2, upper_bound=16), make_run_point(curve)
+        )
+
+        assert knobs(outcome.points) == [2, 4, 8, 6, 3, 5]
+        assert outcome.stop_reason == STOP_CONVERGED
+        assert "throughput_gain_evidence" not in outcome.to_dict()
 
 
 def test_monotonic_climb_to_upper_bound():
@@ -503,15 +705,8 @@ def test_slo_success_floor_fails_point():
     assert 8.0 in knobs(pts)
 
 
-class TestSloStopsAtCapacity:
-    """A loose SLO must not carry the ramp through the saturated region.
-
-    Regression for gpustack benchmark 74 (qwen3-0.6b, concurrency axis, TTFT avg
-    <= 10000ms / TPOT avg <= 1000ms): every point passed such a loose SLO, so the
-    ramp doubled to upper_bound and reported concurrency 1024 as the SLO capacity —
-    a point delivering 6% LESS throughput than 256 at 40x the TTFT (5809ms vs
-    142ms). The curves below are that run's measured numbers.
-    """
+class TestSloContinuesPastThroughputPlateaus:
+    """The SLO boundary depends on latency and success, not throughput growth."""
 
     # Measured output tokens/s and end-to-end latency (ms) per concurrency point.
     BM74_TPS = {
@@ -555,70 +750,327 @@ class TestSloStopsAtCapacity:
             calls=calls,
         )
 
-    def test_loose_slo_stops_where_throughput_stops_climbing(self):
-        # 256 -> 512 is -0.6% throughput: saturated, even though the 10s TTFT
-        # threshold is nowhere near being violated.
-        pts = run(self._cfg(slo_avg_latency_ms=10000.0), self._rp())
-        assert knobs(pts) == [4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0]
-        # The point that made the old run wrong is never measured.
-        assert 1024.0 not in knobs(pts)
-        # And the throughput peak IS in the results for the aggregation side to
-        # fall back on (that is what makes the operating point 256, not 512).
-        assert peak_knob(pts) == 256.0
+    def test_loose_slo_reaches_the_search_bound_after_throughput_declines(self):
+        outcome = run_outcome(self._cfg(slo_avg_latency_ms=10000.0), self._rp())
+        assert knobs(outcome.points) == [
+            4.0,
+            8.0,
+            16.0,
+            32.0,
+            64.0,
+            128.0,
+            256.0,
+            512.0,
+            1024.0,
+        ]
+        assert outcome.stop_reason == STOP_UPPER_BOUND
+        assert outcome.bracket_reason == STOP_UPPER_BOUND
+        assert outcome.slo_bracket == (1024.0, None)
+        assert peak_knob(outcome.points) == 256.0
 
-    def test_loose_slo_does_not_fabricate_a_bisection_bracket(self):
-        # Capacity saturation must NOT be recorded as an SLO failure: bisecting
-        # (256, 512) would return a saturation point dressed up as a latency
-        # boundary. Every measured knob stays on the doubling grid.
-        pts = run(self._cfg(slo_avg_latency_ms=10000.0), self._rp())
+    def test_latency_boundary_is_located_beyond_the_throughput_peak(self):
+        outcome = run_outcome(
+            self._cfg(slo_avg_latency_ms=5000.0, max_points=20), self._rp()
+        )
+        assert outcome.bracket_reason == STOP_SLO_FAILED
+        assert outcome.stop_reason == STOP_CONVERGED
+        passing, failing = outcome.slo_bracket
+        assert passing == 668.0
+        assert failing == 669.0
+        assert peak_knob(outcome.points) == 256.0
+
+    def test_plateau_does_not_create_a_false_slo_failure(self):
+        outcome = run_outcome(self._cfg(slo_avg_latency_ms=10000.0), self._rp())
+        assert outcome.slo_bracket[1] is None
         assert all(
-            float(k).is_integer() and int(k) & (int(k) - 1) == 0 for k in knobs(pts)
+            float(k).is_integer() and int(k) & (int(k) - 1) == 0
+            for k in knobs(outcome.points)
         )
 
-    def test_tight_slo_still_bisects_because_latency_breaks_first(self):
-        # Same curve, a threshold that bites at 64 (630ms) — well before the 512
-        # plateau. The SLO predicate is checked FIRST, so this is a real bracket.
-        calls = []
-        pts = run(self._cfg(slo_avg_latency_ms=500.0), self._rp(calls))
-        assert any(32 < k < 64 for k in calls), calls
-        assert _max_passing_knob(pts, 500.0) is not None
-        assert max(knobs(pts)) <= 64.0
-
-    def test_rate_axis_uses_the_cant_keepup_signal_too(self):
-        # Rate axis, loose SLO, server pinned at 10 rps: achieved stops growing
-        # even though throughput-per-token and latency both look acceptable.
-        pts = run(
-            self._cfg(axis="rate", lower_bound=1, slo_avg_latency_ms=100000.0),
+    def test_rate_search_continues_when_achieved_rate_stops_growing(self):
+        outcome = run_outcome(
+            self._cfg(
+                axis="rate",
+                lower_bound=1,
+                upper_bound=128,
+                max_points=20,
+                slo_avg_latency_ms=700.0,
+            ),
             make_run_point(
                 lambda k: min(k, 10) * 100.0,
                 achieved_fn=lambda k: min(k, 10),
-                latency_fn=lambda k: 100.0,
+                latency_fn=lambda k: k * 10.0,
             ),
         )
-        assert max(knobs(pts)) <= 32.0, knobs(pts)
+        assert outcome.stop_reason == STOP_CONVERGED
+        assert outcome.slo_bracket == (70.0, 71.0)
+        assert 64.0 in knobs(outcome.points)
 
-    def test_the_capacity_stop_is_reported_not_left_to_be_guessed(self):
-        # The whole point of reporting it: this run and one that stopped because a
-        # threshold broke at the top are INDISTINGUISHABLE from the grid — both end
-        # with "the highest knob measured met the SLO". Only the ramp knows which.
-        o = run_outcome(self._cfg(slo_avg_latency_ms=10000.0), self._rp())
-        assert o.bracket_reason == STOP_CAPACITY_PLATEAU
-        assert o.stop_reason == STOP_CAPACITY_PLATEAU  # Phase 2 never ran
-        assert o.stopped_at == 512.0
-        assert o.upper_bound == 1024.0  # stopped of its own accord, mid-range
-        # first_fail=None says the SLO number is a floor, not a located boundary.
-        assert o.slo_bracket == (512.0, None)
-        assert o.target == "slo"
+    def test_flat_throughput_still_respects_the_point_budget(self):
+        outcome = run_outcome(
+            self._cfg(lower_bound=1, max_points=3, slo_avg_latency_ms=500.0),
+            make_run_point(lambda k: 100.0),
+        )
+        assert knobs(outcome.points) == [1.0, 2.0, 4.0]
+        assert outcome.stop_reason == STOP_BUDGET_POINTS
+        assert outcome.slo_bracket == (4.0, None)
 
-    def test_a_real_latency_boundary_reports_slo_failed_then_converged(self):
-        # Same curve, threshold that bites at 64: Phase 1 brackets on the SLO and
-        # Phase 2 closes the interval. Both facts are needed — "slo_failed" is why
-        # the answer is a latency boundary, "converged" is that nothing cut it short.
-        o = run_outcome(self._cfg(slo_avg_latency_ms=500.0), self._rp())
-        assert o.bracket_reason == STOP_SLO_FAILED
-        assert o.stop_reason == STOP_CONVERGED
-        lo, hi = o.slo_bracket
-        assert lo is not None and hi is not None and hi - lo <= 1
+    def test_flat_throughput_still_respects_the_time_budget(self, monkeypatch):
+        import benchmark_runner.auto_tune as auto_tune
+
+        clock = [0.0]
+        monkeypatch.setattr(auto_tune.time, "monotonic", lambda: clock[0])
+
+        async def point(knob, index):
+            clock[0] += 1.0
+            return make_metrics(knob, index, 100.0)
+
+        outcome = run_outcome(
+            self._cfg(
+                lower_bound=1,
+                max_points=20,
+                max_total_seconds=2.5,
+                slo_avg_latency_ms=500.0,
+            ),
+            point,
+        )
+        assert knobs(outcome.points) == [1.0, 2.0, 4.0]
+        assert outcome.stop_reason == STOP_BUDGET_SECONDS
+
+    def test_flat_throughput_still_brackets_request_failures(self):
+        outcome = run_outcome(
+            self._cfg(lower_bound=1, slo_avg_latency_ms=10000.0),
+            make_run_point(lambda k: 100.0, success_fn=lambda k: 1.0 if k < 8 else 0.9),
+        )
+        assert outcome.stop_reason == STOP_CONVERGED
+        assert outcome.slo_bracket == (7.0, 8.0)
+
+    def test_a_latency_boundary_before_saturation_still_converges(self):
+        outcome = run_outcome(self._cfg(slo_avg_latency_ms=500.0), self._rp())
+        assert outcome.bracket_reason == STOP_SLO_FAILED
+        assert outcome.stop_reason == STOP_CONVERGED
+        passing, failing = outcome.slo_bracket
+        assert passing is not None and failing is not None and failing - passing <= 1
+
+
+class TestSloThroughputDeclineProtection:
+    """Sustained total TPS loss can end expansion without declaring an SLO failure."""
+
+    @staticmethod
+    def cfg(**overrides):
+        settings = dict(
+            lower_bound=1,
+            upper_bound=64,
+            max_points=20,
+            slo_avg_latency_ms=1000.0,
+        )
+        settings.update(overrides)
+        return sat_cfg(**settings)
+
+    @pytest.mark.parametrize("axis", ["concurrency", "rate"])
+    def test_two_significant_drops_stop_without_fabricating_a_boundary(self, axis):
+        curve = piecewise({1: 1000, 2: 1500, 4: 1200, 8: 1190, 64: 1100})
+        outcome = run_outcome(self.cfg(axis=axis), make_run_point(curve))
+
+        assert knobs(outcome.points) == [1.0, 2.0, 4.0, 8.0]
+        assert outcome.stop_reason == "throughput_decline"
+        assert outcome.bracket_reason == "throughput_decline"
+        assert outcome.slo_bracket == (8.0, None)
+        assert outcome.to_dict()["stop_reason"] == "throughput_decline"
+
+    @pytest.mark.parametrize("axis", ["concurrency", "rate"])
+    def test_stop_records_the_peak_and_each_qualifying_measurement(self, axis):
+        curve = piecewise({64: 10000, 128: 8200, 256: 8000, 1024: 7000})
+        outcome = run_outcome(
+            self.cfg(axis=axis, lower_bound=64, upper_bound=1024),
+            make_run_point(curve),
+        )
+
+        assert outcome.stop_reason == "throughput_decline"
+        assert outcome.slo_bracket == (256.0, None)
+        assert outcome.to_dict().get("throughput_decline") == {
+            "threshold_percent": 15,
+            "consecutive_points": 2,
+            "peak_rate": 64.0,
+            "peak_total_tps": 10000.0,
+            "points": [
+                {"rate": 128.0, "total_tps": 8200.0, "drop_percent": 18.0},
+                {"rate": 256.0, "total_tps": 8000.0, "drop_percent": 20.0},
+            ],
+        }
+
+    def test_recorded_evidence_excludes_discarded_dips_before_a_new_peak(self):
+        curve = piecewise({1: 1000, 2: 1500, 4: 1200, 8: 2000, 16: 1600, 32: 1500})
+        outcome = run_outcome(self.cfg(), make_run_point(curve))
+
+        assert outcome.to_dict().get("throughput_decline") == {
+            "threshold_percent": 15,
+            "consecutive_points": 2,
+            "peak_rate": 8.0,
+            "peak_total_tps": 2000.0,
+            "points": [
+                {"rate": 16.0, "total_tps": 1600.0, "drop_percent": 20.0},
+                {"rate": 32.0, "total_tps": 1500.0, "drop_percent": 25.0},
+            ],
+        }
+
+    def test_evidence_records_the_policy_in_force_at_the_stop(self, monkeypatch):
+        import benchmark_runner.auto_tune as at
+
+        monkeypatch.setattr(at, "SLO_THROUGHPUT_DROP_RATIO", 0.2)
+        monkeypatch.setattr(at, "SLO_THROUGHPUT_DROP_POINTS", 3)
+        curve = piecewise({1: 1000, 2: 750, 4: 700, 8: 600})
+        outcome = run_outcome(self.cfg(), make_run_point(curve))
+
+        assert knobs(outcome.points) == [1.0, 2.0, 4.0, 8.0]
+        assert outcome.to_dict().get("throughput_decline") == {
+            "threshold_percent": 20,
+            "consecutive_points": 3,
+            "peak_rate": 1.0,
+            "peak_total_tps": 1000.0,
+            "points": [
+                {"rate": 2.0, "total_tps": 750.0, "drop_percent": 25.0},
+                {"rate": 4.0, "total_tps": 700.0, "drop_percent": 30.0},
+                {"rate": 8.0, "total_tps": 600.0, "drop_percent": 40.0},
+            ],
+        }
+
+    def test_a_single_dip_followed_by_recovery_does_not_stop(self):
+        curve = piecewise({1: 1000, 2: 1500, 4: 1000, 8: 1600, 64: 1600})
+        outcome = run_outcome(self.cfg(), make_run_point(curve))
+
+        assert outcome.stop_reason == STOP_UPPER_BOUND
+        assert outcome.slo_bracket == (64.0, None)
+        assert "throughput_decline" not in outcome.to_dict()
+
+    def test_small_declines_do_not_stop_expansion(self):
+        curve = piecewise({1: 1000, 2: 1500, 4: 1400, 8: 1300, 16: 1280, 64: 1300})
+        outcome = run_outcome(self.cfg(), make_run_point(curve))
+
+        assert outcome.stop_reason == STOP_UPPER_BOUND
+        assert max(knobs(outcome.points)) == 64.0
+
+    def test_partial_recovery_resets_the_consecutive_decline_count(self):
+        curve = piecewise({1: 1000, 2: 1500, 4: 1200, 8: 1450, 16: 1200, 32: 1100})
+        outcome = run_outcome(self.cfg(), make_run_point(curve))
+
+        assert outcome.stop_reason == "throughput_decline"
+        assert max(knobs(outcome.points)) == 32.0
+        assert outcome.slo_bracket == (32.0, None)
+
+    def test_a_fifteen_percent_loss_persisting_for_two_loads_is_enough(self):
+        curve = piecewise({1: 1000, 2: 850, 4: 850, 64: 850})
+        outcome = run_outcome(self.cfg(), make_run_point(curve))
+
+        assert knobs(outcome.points) == [1.0, 2.0, 4.0]
+        assert outcome.stop_reason == "throughput_decline"
+
+    def test_latency_failure_takes_precedence_and_bisection_continues(self):
+        curve = piecewise({1: 1000, 2: 1500, 4: 1200, 8: 1100})
+        outcome = run_outcome(
+            self.cfg(), make_run_point(curve, latency_fn=lambda k: k * 200)
+        )
+
+        assert outcome.bracket_reason == STOP_SLO_FAILED
+        assert outcome.stop_reason == STOP_CONVERGED
+        assert outcome.slo_bracket == (5.0, 6.0)
+        assert "throughput_decline" not in outcome.to_dict()
+
+    def test_request_failures_take_precedence_over_throughput_protection(self):
+        curve = piecewise({1: 1000, 2: 1500, 4: 1200, 8: 1100})
+        outcome = run_outcome(
+            self.cfg(),
+            make_run_point(curve, success_fn=lambda k: 1.0 if k < 8 else 0.9),
+        )
+
+        assert outcome.bracket_reason == STOP_SLO_FAILED
+        assert outcome.stop_reason == STOP_CONVERGED
+        assert outcome.slo_bracket == (7.0, 8.0)
+
+    def test_point_budget_can_end_before_decline_is_confirmed(self):
+        curve = piecewise({1: 1000, 2: 1500, 4: 1200, 8: 1100})
+        outcome = run_outcome(self.cfg(max_points=3), make_run_point(curve))
+
+        assert knobs(outcome.points) == [1.0, 2.0, 4.0]
+        assert outcome.stop_reason == STOP_BUDGET_POINTS
+        assert outcome.slo_bracket == (4.0, None)
+        assert "throughput_decline" not in outcome.to_dict()
+
+
+class TestTotalThroughputIsAuthoritative:
+    @staticmethod
+    def measured(knob, index, *, total, output):
+        point = make_metrics(knob, index, output)
+        point.total_tps = total
+        return point
+
+    def test_total_peak_drives_saturation_even_when_output_keeps_growing(self):
+        totals = piecewise({1: 1000, 2: 2000, 4: 3000, 8: 2000, 16: 1000})
+
+        async def point(knob, index):
+            return self.measured(knob, index, total=totals(knob), output=knob * 100)
+
+        outcome = run_outcome(
+            sat_cfg(lower_bound=1, upper_bound=16, max_points=20), point
+        )
+        assert outcome.bracket_reason == STOP_CAPACITY_PLATEAU
+        assert max(outcome.points, key=lambda p: p.total_tps).knob == 4.0
+        assert outcome.to_dict()["points"][0].get("total_tps") == 1000
+
+    def test_output_decline_does_not_stop_slo_when_total_keeps_growing(self):
+        outputs = piecewise({1: 1500, 2: 1200, 4: 1100, 8: 900, 16: 800})
+
+        async def point(knob, index):
+            return self.measured(knob, index, total=knob * 5000, output=outputs(knob))
+
+        outcome = run_outcome(
+            sat_cfg(
+                lower_bound=1, upper_bound=16, max_points=20, slo_avg_latency_ms=1000
+            ),
+            point,
+        )
+        assert outcome.stop_reason == STOP_UPPER_BOUND
+        assert outcome.slo_bracket == (16.0, None)
+
+    def test_total_decline_protects_slo_even_when_output_keeps_growing(self):
+        totals = piecewise({1: 1000, 2: 1500, 4: 1200, 8: 1190, 16: 1100})
+
+        async def point(knob, index):
+            return self.measured(knob, index, total=totals(knob), output=knob * 100)
+
+        outcome = run_outcome(
+            sat_cfg(
+                lower_bound=1, upper_bound=16, max_points=20, slo_avg_latency_ms=1000
+            ),
+            point,
+        )
+        assert outcome.stop_reason == "throughput_decline"
+        assert outcome.slo_bracket == (8.0, None)
+        evidence = outcome.to_dict()["throughput_decline"]
+        assert evidence["peak_total_tps"] == 1500
+        assert evidence["points"] == [
+            {"rate": 4.0, "total_tps": 1200.0, "drop_percent": 20.0},
+            {"rate": 8.0, "total_tps": 1190.0, "drop_percent": 20.666667},
+        ]
+
+    def test_normalization_reads_recorded_total_independently_of_output(self):
+        report = SimpleNamespace(
+            metrics=SimpleNamespace(
+                request_totals=SimpleNamespace(total=100, successful=100),
+                tokens_per_second=SimpleNamespace(
+                    successful=SimpleNamespace(mean=3000)
+                ),
+                prompt_tokens_per_second=SimpleNamespace(
+                    successful=SimpleNamespace(mean=8000)
+                ),
+                output_tokens_per_second=SimpleNamespace(
+                    successful=SimpleNamespace(mean=1000)
+                ),
+            )
+        )
+        point = _normalize(report, 4, 0)
+        assert getattr(point, "total_tps", None) == 3000
+        assert point.output_tps == 1000
 
 
 # ── injection / plumbing ─────────────────────────────────────────────────────
@@ -1081,31 +1533,20 @@ class TestStopReasons:
         assert o.stopped_at is not None and o.stopped_at < o.probe_bound
 
     def test_a_search_that_finished_on_its_last_allowed_point_still_converged(self):
-        """A completed Phase 2 must not be relabelled `budget_points`.
-
-        The budget used to be tested in the loop PREDICATE, and `and` short-circuits:
-        reaching the `else` with a closed bracket said nothing about the budget, yet
-        the budget was consulted anyway. Two runs of the same curve then produced the
-        same nine points, the same peak, and opposite verdicts — `budget_points`
-        ("truncated, raise the cap") whenever the point count happened to land
-        exactly on max_points, `converged` otherwise. Raising the cap changes
-        nothing, so the advice was not just imprecise but wrong.
-
-        The budget is now consulted only after a next point has been established, so
-        it is blamed only when it actually prevented a measurement.
-        """
-        curve = piecewise({8: 800, 12: 1300, 16: 1200, 32: 1150})
+        """Exhausting the integer grid completes the search even at the point cap."""
+        curve = piecewise({2: 1600, 3: 3280, 4: 3300, 5: 3280, 6: 3280, 8: 3290})
         exact = run_outcome(
-            sat_cfg(lower_bound=8, upper_bound=1024, max_points=9),
+            sat_cfg(lower_bound=2, upper_bound=16, max_points=6),
             make_run_point(curve),
         )
         roomy = run_outcome(
-            sat_cfg(lower_bound=8, upper_bound=1024, max_points=20),
+            sat_cfg(lower_bound=2, upper_bound=16, max_points=20),
             make_run_point(curve),
         )
         # Same search, so it must read the same either way.
         assert knobs(exact.points) == knobs(roomy.points)
-        assert peak_knob(exact.points) == peak_knob(roomy.points) == 12.0
+        assert len(exact.points) == 6
+        assert peak_knob(exact.points) == peak_knob(roomy.points) == 4.0
         assert exact.stop_reason == roomy.stop_reason == STOP_CONVERGED
 
     def test_a_peak_search_the_budget_really_did_cut_short_says_so(self):
@@ -1336,6 +1777,7 @@ class TestTpotIsDecodeOnly:
             metrics=SimpleNamespace(
                 request_totals=SimpleNamespace(total=100, successful=100),
                 output_tokens_per_second=dist(500.0),
+                tokens_per_second=dist(1000.0),
                 time_to_first_token_ms=dist(200.0),
                 inter_token_latency_ms=dist(itl),
                 time_per_output_token_ms=dist(tpot_incl_ttft),
@@ -1438,7 +1880,7 @@ class TestTheCapDoesNotOutrankAMeasurement:
         # chart. Stopping at the cap leaves a grid still climbing at its last row.
         pts = self._run().points
         top = max(pts, key=lambda p: p.knob)
-        assert top.output_tps < peak_tps(pts)
+        assert top.total_tps < peak_tps(pts)
 
     def test_the_hard_bound_still_ends_it(self):
         # Only cfg.upper_bound is a hard stop: a server that keeps up all the way

@@ -47,6 +47,7 @@ def make_point(knob, tps, *, ttft_p99=100.0, tpot=10.0, success=1.0, achieved=No
         "knob": float(knob),
         "index": 0,
         "output_tps": float(tps),
+        "total_tps": float(tps),
         "ttft_ms": ttft_p99 * 0.6,
         "ttft_p95_ms": ttft_p99 * 0.9,
         "ttft_p99_ms": float(ttft_p99),
@@ -74,6 +75,39 @@ CURVE = [
 
 
 class TestVerdictsMatchTheWebReport:
+    def test_gain_convergence_reports_a_normal_end_with_the_measured_total_peak(self):
+        text = "\n".join(
+            render_curve_report(
+                CURVE,
+                stop_reason="throughput_gain_converged",
+                bracket_reason="capacity_plateau",
+                mode=CHART_NONE,
+                style=UNICODE,
+            )
+        )
+
+        assert "Recommended: 30 req/s" in text
+        assert "34,500 tok/s" in text
+        assert "Peak refinement converged on total-throughput gain" in text
+        assert "stopped: throughput_gain_converged (bracket: capacity_plateau)" in text
+
+    def test_peak_uses_total_even_when_output_peak_is_elsewhere(self):
+        points = [
+            {**make_point(4, 1000), "total_tps": 5000},
+            {**make_point(8, 2000), "total_tps": 4000},
+        ]
+        assert best_points(points, None)["peak_knob"] == 4.0
+        text = "\n".join(render_curve_report(points, mode=CHART_AUTO, style=UNICODE))
+        assert "total throughput (tok/s)" in text
+        assert "5,000 tok/s" in text
+
+    def test_an_output_only_legacy_curve_does_not_invent_a_total_peak(self):
+        points = [{k: v for k, v in make_point(4, 1000).items() if k != "total_tps"}]
+        assert best_points(points, None)["peak_knob"] is None
+        text = "\n".join(render_curve_report(points, mode=CHART_NONE, style=UNICODE))
+        assert "total throughput was not recorded" in text.lower()
+        assert "Recommended:" not in text
+
     """Ports of gpustack-ui's ``getStageStatus`` (ui.tsx) and ``compute_best_points``."""
 
     def _status(self, point, slo=None, points=None):
@@ -88,12 +122,13 @@ class TestVerdictsMatchTheWebReport:
     def test_the_recommended_point_is_the_throughput_peak_without_an_slo(self):
         assert best_points(CURVE, None)["recommended_knob"] == 30.0
 
-    def test_an_slo_caps_the_recommendation_but_never_lifts_it(self):
-        # min(slo_met, peak): an SLO met only below the peak binds...
-        assert best_points(CURVE, 16.0)["recommended_knob"] == 16.0
-        # ...and one still met AT/above the peak does not push past it, because
-        # past the peak more load buys no more throughput.
-        assert best_points(CURVE, 64.0)["recommended_knob"] == 30.0
+    def test_slo_primary_result_is_the_highest_passing_load(self):
+        assert best_points(CURVE, 16.0, "slo")["recommended_knob"] == 16.0
+        assert best_points(CURVE, 64.0, "slo")["recommended_knob"] == 64.0
+        assert best_points(CURVE, 64.0, "slo")["peak_knob"] == 30.0
+
+    def test_an_unmet_slo_has_no_primary_point(self):
+        assert best_points(CURVE, None, "slo")["recommended_knob"] is None
 
     def test_recommended_outranks_peak_on_the_same_point(self):
         # 30 is both. The badge that matters is "this is the answer".
@@ -196,6 +231,51 @@ class TestWhatEachModeShows:
 
 
 class TestTheSloTargetIsReportedAsABoundary:
+    def test_throughput_decline_is_a_protective_stop_with_unlocated_slo_boundary(self):
+        points = [
+            make_point(1, 1000),
+            make_point(2, 1500),
+            make_point(4, 1200),
+            make_point(8, 1190),
+        ]
+        text = "\n".join(
+            render_curve_report(
+                points,
+                axis="concurrency",
+                target="slo",
+                slo_met_knob=8.0,
+                stop_reason="throughput_decline",
+                bracket_reason="throughput_decline",
+                mode=CHART_NONE,
+                style=UNICODE,
+            )
+        )
+        assert "Protective stop" in text
+        assert "SLO boundary not located" in text
+        assert "Recommended: 8 streams" in text
+        assert "SLO boundary bracketed" not in text
+
+    def test_an_unmet_slo_is_reported_without_a_peak_recommendation(self):
+        text = "\n".join(
+            render_curve_report(CURVE, target="slo", mode=CHART_NONE, style=UNICODE)
+        )
+        assert "SLO met by no measured point" in text
+        assert "Recommended:" not in text
+
+    def test_a_peak_below_the_slo_boundary_is_reported_as_an_observation(self):
+        text = "\n".join(
+            render_curve_report(
+                CURVE,
+                target="slo",
+                slo_met_knob=64.0,
+                mode=CHART_NONE,
+                style=UNICODE,
+            )
+        )
+        assert "Recommended: 64 req/s" in text
+        assert "Measured total-TPS peak: 30 req/s" in text
+        assert "capped here by the SLO" not in text
+
     def test_a_bracketed_boundary_names_both_ends(self):
         text = "\n".join(
             render_curve_report(
@@ -210,7 +290,7 @@ class TestTheSloTargetIsReportedAsABoundary:
         )
         assert "SLO boundary bracketed at (16, 30)" in text
         # The throughput left on the table is the other half of the answer.
-        assert "throughput peaks higher, at 30 req/s" in text
+        assert "Measured total-TPS peak: 30 req/s" in text
 
     def test_an_unbroken_slo_is_reported_as_a_floor_not_an_edge(self):
         # first_fail=None means no point ever breached it, so the number is "at
@@ -523,6 +603,7 @@ def _stub_benchmark_call(monkeypatch):
                     total=100, successful=100 if rate <= 34 else 93
                 ),
                 output_tokens_per_second=stat(max(tps, 0.0)),
+                tokens_per_second=stat(max(tps, 0.0)),
                 time_to_first_token_ms=stat(ttft),
                 inter_token_latency_ms=stat(2.2 + rate * 0.45),
                 time_per_output_token_ms=stat(2.2 + rate * 0.45),
