@@ -291,6 +291,35 @@ class TestSearchRangeIsHard:
         ks = knobs(pts)
         assert min(ks) >= 4.0 and max(ks) <= 64.0, f"outside [4, 64]: {ks}"
 
+    def test_rate_search_stops_at_a_narrow_upper_bound(self):
+        outcome = run_outcome(
+            sat_cfg(
+                axis="rate",
+                lower_bound=1,
+                upper_bound=4,
+                probe_saturation=True,
+            ),
+            make_run_point(lambda k: k * 1000.0),
+            probe=make_probe(250),
+        )
+
+        assert knobs(outcome.points) == [1.0, 2.0, 4.0]
+        assert outcome.stop_reason == STOP_UPPER_BOUND
+
+    def test_slo_concurrency_search_stops_at_a_non_power_of_two_bound(self):
+        outcome = run_outcome(
+            sat_cfg(
+                axis="concurrency",
+                lower_bound=4,
+                upper_bound=138,
+                slo_avg_latency_ms=1000.0,
+            ),
+            make_run_point(lambda k: k * 1000.0),
+        )
+
+        assert knobs(outcome.points) == [4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 138.0]
+        assert outcome.stop_reason == STOP_UPPER_BOUND
+
     def test_normal_curve_still_starts_at_lower_bound(self):
         # Control: a healthy curve must NOT trigger the downward search.
         pts = run(
@@ -324,6 +353,22 @@ def test_respects_max_points_budget():
     curve = piecewise({1: 100, 2: 200, 4: 400, 8: 800, 16: 1600, 32: 3200, 64: 900})
     pts = run(sat_cfg(max_points=4), make_run_point(curve))
     assert len(pts) <= 4
+
+
+def test_slo_concurrency_search_stops_after_three_measured_points():
+    outcome = run_outcome(
+        sat_cfg(
+            axis="concurrency",
+            lower_bound=4,
+            upper_bound=100,
+            max_points=3,
+            slo_avg_latency_ms=70.0,
+        ),
+        make_run_point(lambda k: k * 1000.0, latency_fn=lambda k: k * 5.0),
+    )
+
+    assert knobs(outcome.points) == [4.0, 8.0, 16.0]
+    assert outcome.stop_reason == STOP_BUDGET_POINTS
 
 
 def test_ties_prefer_lower_knob():
