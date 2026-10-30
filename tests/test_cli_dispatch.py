@@ -18,6 +18,7 @@ import benchmark_runner.main as main
 from benchmark_runner import auto_tune
 from benchmark_runner.auto_tune import RampOutcome
 from benchmark_runner.main import cli
+from benchmark_runner.scenario_builder import build_scenario_args
 
 
 @pytest.mark.parametrize(
@@ -306,6 +307,40 @@ class TestStageSeedPolicy:
             monkeypatch, "--random-seed", "7", "--no-seed-increment"
         )
         assert seeds == [7, 7, 7]
+
+
+def test_manual_rate_stages_preserve_fractional_rates(monkeypatch, tmp_path):
+    rates = []
+
+    def spy(local_kwargs):
+        scenario = build_scenario_args(local_kwargs)
+        rates.extend(scenario.spec.profile.rate)
+        return scenario
+
+    async def noop(*args, **kwargs):
+        return None, None
+
+    monkeypatch.setattr(main, "build_scenario_args", spy)
+    monkeypatch.setattr(main, "benchmark_generative_text", noop)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "benchmark",
+            "run",
+            "--axis",
+            "rate",
+            "--target",
+            "http://127.0.0.1:8000",
+            "--stages",
+            '[{"rate": 0.1}, {"rate": 0.3}]',
+            "--data",
+            "prompt_tokens=8,output_tokens=8",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert rates == [0.1, 0.3]
 
 
 def test_auto_tune_preserves_explicit_seed_zero(monkeypatch, tmp_path):

@@ -89,6 +89,11 @@ def test_every_profile_kind_builds(profile, extra):
     assert scenario.spec.profile.kind == profile
 
 
+def test_constant_profile_preserves_fractional_request_rate():
+    scenario = build_scenario_args(base_kwargs(profile="constant", rate=[0.1]))
+    assert scenario.spec.profile.rate == [0.1]
+
+
 class TestThroughputMaxConcurrency:
     """Regression: the saturation probe used to emit a bare {"kind": "throughput"}.
 

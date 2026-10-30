@@ -144,6 +144,15 @@ def run_outcome(cfg, rp, probe=None):
     return asyncio.run(run_ramp(cfg, {}, "t", run_point=rp, saturation_probe=probe))
 
 
+@pytest.mark.parametrize("rate", [0.001, 0.1, 0.5])
+def test_rate_search_preserves_fractional_start(rate):
+    outcome = run_outcome(
+        sat_cfg(axis="rate", lower_bound=rate, upper_bound=rate * 2, max_points=1),
+        make_run_point(lambda knob: knob * 100),
+    )
+    assert knobs(outcome.points) == [rate]
+
+
 def make_probe(ceiling, calls=None):
     """A saturation probe returning a fixed ceiling rps (records calls if given)."""
 
