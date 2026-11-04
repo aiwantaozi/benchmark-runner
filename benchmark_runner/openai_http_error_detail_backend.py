@@ -34,6 +34,8 @@ Adjustments in this module:
    ``RequestInfo.timings`` under ``ITL_TIMINGS_FIELD``; ``output_dual_json``
    aggregates them into a distribution. See that module for the aggregation and
    for why this needs no guidellm changes.
+6) Split streaming responses only on SSE line endings (CR, LF, CRLF), preserving
+   Unicode line separators inside JSON strings.
 
 guidellm 0.7.x vs 0.6.0:
 - Backend config is stored on ``self._args`` (an ``OpenAIHTTPBackendArgs``), not as
@@ -338,6 +340,31 @@ class OpenAIHTTPErrorDetailBackend(OpenAIHTTPBackend):
         request_handler.post_validation(gen_response)
         yield gen_response, request_info
         self._check_tool_call_expectations(request, gen_response)
+
+    async def _aiter_lines(self, stream: httpx.Response) -> AsyncIterator[str]:
+        """Read SSE lines without treating Unicode text as protocol delimiters.
+
+        HTTPX's generic line iterator also splits on U+0085, U+2028 and U+2029,
+        which are valid inside JSON strings. Decode UTF-8 incrementally through
+        ``aiter_text`` and keep fragments until a CR or LF ends the line.
+        """
+        fragments: list[str] = []
+        skip_lf = False
+        async for text in stream.aiter_text():
+            if skip_lf:
+                text = text.removeprefix("\n")
+            skip_lf = text.endswith("\r")
+            segments = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            fragments.append(segments[0])
+            for segment in segments[1:]:
+                line = "".join(fragments)
+                if line.strip():
+                    yield line
+                fragments = [segment]
+
+        line = "".join(fragments)
+        if line.strip():
+            yield line
 
     async def _resolve_streaming(
         self,
