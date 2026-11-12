@@ -1,0 +1,35 @@
+{
+  "include": [
+    "benchmark_runner/**/*.py",
+    "tests/**/*.py"
+  ],
+  "exclude": [
+    "uv.lock",
+    "**/__pycache__/**",
+    "**/.venv*/**",
+    "build/**",
+    "dist/**"
+  ],
+  "rules": [
+    {
+      "path": "benchmark_runner/auto_tune.py",
+      "merge_system_rule": true,
+      "rule": "Adaptive benchmark search. Flag measurements outside the configured bounds, point or duration budget overruns, invalid fractional request rates or non-integral concurrency, and search termination that misreports an unlocated boundary as converged. Check throughput and SLO decisions against the measured metrics, including latency units and failed requests. Preserve deterministic seed handling and distinguish measured results from recommendations. Verify sidecar schema compatibility with the CLI, chart renderer, and GPUStack consumers."
+    },
+    {
+      "path": "benchmark_runner/**/*.py",
+      "merge_system_rule": true,
+      "rule": "Benchmark Runner wraps the pinned GuideLLM version in pyproject.toml. Verify integration changes against that version's APIs and preserve CLI options, progress payloads, output schemas, and request-handler registration. Flag incorrect token accounting, latency unit conversion, success-rate or throughput calculations, and SSE parsing that loses streamed content. Keep TLS overrides scoped to the intended connection, never expose authorization tokens or user prompts in logs, and clean up HTTP sessions, tasks, and temporary files on failure or cancellation."
+    },
+    {
+      "path": "tests/**/*.py",
+      "merge_system_rule": true,
+      "rule": "Regression tests should exercise observable benchmark behavior and meaningful edge cases. Keep inference servers, network calls, processors, and clocks mocked at their external boundaries so tests do not require GPUs, downloaded models, or live services. Flag nondeterministic timing assumptions and assertions that pass without exercising the behavior under test. Do not infer missing coverage merely because an unchanged test is absent from the diff."
+    },
+    {
+      "path": "README.md",
+      "merge_system_rule": true,
+      "rule": "Check examples and documented defaults against the actual CLI and pinned GuideLLM version. Distinguish request rate from concurrency and milliseconds from seconds. Keep documented output schemas, search bounds, budgets, stop reasons, and seed behavior consistent with the implementation. Flag credentials or other secrets in examples."
+    }
+  ]
+}
