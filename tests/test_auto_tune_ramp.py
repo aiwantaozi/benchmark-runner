@@ -130,6 +130,9 @@ def sat_cfg(**kw):
         upper_bound=1024,
         max_points=12,
         probe_saturation=False,
+        # These fixtures isolate the original bracket/refinement rules. The new
+        # two-point default and recovery behavior have separate regression cases.
+        plateau_confirmations=1,
     )
     d.update(kw)
     return AutoTuneConfig(**d)
@@ -264,7 +267,7 @@ class TestThroughputGainConvergence:
                 {"rate": 56, "total_tps": 3315, "best_total_tps": 3320},
             ],
         }
-        assert outcome.to_dict()["version"] == 7
+        assert outcome.to_dict()["version"] == 8
         assert "throughput_decline" not in outcome.to_dict()
 
     def test_small_new_records_do_not_restart_the_window(self):
@@ -1756,6 +1759,8 @@ class TestStopReasons:
             make_run_point(lambda k: k * 1000.0),
         )
         d = o.to_dict()
+        analysis = d.pop("analysis")
+        assert analysis["throughput_peak"]["knob"] == 32
         assert d == {
             "version": RAMP_OUTCOME_VERSION,
             "points": [asdict(p) for p in o.points],
@@ -1777,6 +1782,7 @@ class TestStopReasons:
             "probe_relaxed": 0,
             "probe_bound": None,
             "slo_thresholds": {},
+            "plateau_confirmations": 1,
         }
         # v2: the measured grid is inline as well as in the report files, so a
         # reader holding only this file can redraw the curve (`benchmark-runner

@@ -12,9 +12,11 @@ from . import openai_http_error_detail_backend  # noqa: F401 # Register custom b
 # ``openai_http_error_detail`` backend args and ``dual_json`` output args.
 from guidellm.benchmark import BenchmarkArgs, BenchmarkScenario  # noqa: E402
 
-# ``parents=True`` also rebuilds models that embed these (e.g.
-# GenerativeBenchmarksReport.config) so their tagged-union serializers recognize
-# our custom backend/output subclasses (avoids PydanticSerializationUnexpectedValue
-# warnings when the report config is dumped).
-BenchmarkArgs.reload_schema(parents=True)
-BenchmarkScenario.reload_schema(parents=True)
+# Rebuild only the models embedding our extensions. In 0.8.1, recursively
+# rebuilding every parent also traverses recursive trace schemas and can fail
+# with an unresolved Pydantic reference during import.
+from guidellm.benchmark.schemas import GenerativeBenchmarksReport  # noqa: E402
+
+BenchmarkArgs.reload_schema()
+BenchmarkScenario.reload_schema()
+GenerativeBenchmarksReport.model_rebuild(force=True)

@@ -39,6 +39,20 @@ def _stats(gaps: list[float] | None) -> SimpleNamespace:
     return SimpleNamespace(info=info)
 
 
+def test_itl_filters_each_gap_by_its_token_event_time():
+    stat = _stats([100.0, 900.0, 200.0])
+    stat.request_start_time = 8.0
+    stat.request_end_time = 22.0
+    stat.info.timings.inter_token_latency_timestamps = [9.0, 11.0, 21.0]
+    benchmark = _report(successful=[stat]).benchmarks[0]
+    benchmark.start_time = 10.0
+    benchmark.end_time = 20.0
+    metric = _output()._itl_distribution(benchmark)
+    assert metric.successful.mean == pytest.approx(900.0)
+    assert metric.successful.min == pytest.approx(900.0)
+    assert metric.successful.max == pytest.approx(900.0)
+
+
 def _report(successful, incomplete=(), errored=()) -> SimpleNamespace:
     return SimpleNamespace(
         benchmarks=[

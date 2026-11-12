@@ -75,6 +75,26 @@ CURVE = [
 
 
 class TestVerdictsMatchTheWebReport:
+    def test_fitted_knee_is_not_presented_as_a_measured_recommendation(self):
+        text = "\n".join(
+            render_curve_report(
+                CURVE,
+                style=ASCII,
+                mode=CHART_NONE,
+                analysis={
+                    "throughput_peak": {"knob": 30, "value": 34500},
+                    "throughput_knee": {"status": "ok", "knee": 19.5},
+                    "slo_capacity": {"knob": 16},
+                    "unresolved_slo_knobs": [16],
+                },
+            )
+        )
+        assert "Measured total-throughput peak: 30" in text
+        assert "Fitted output-throughput knee: 19.5" in text
+        assert "requires measurement" in text
+        assert "SLO highest measured pass: 16" in text
+        assert "Joint SLO attainment is unresolved" in text
+
     def test_gain_convergence_reports_a_normal_end_with_the_measured_total_peak(self):
         text = "\n".join(
             render_curve_report(

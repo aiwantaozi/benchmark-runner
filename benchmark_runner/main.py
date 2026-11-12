@@ -7,7 +7,8 @@ Benchmark Runner command-line interface entry point.
 
 This is the main CLI for Benchmark Runner, customized for this project.
 Key customizations:
-- Uses custom progress and output modules (see benchmark_runner.progress, benchmark_runner.chained_progress).
+- Uses custom progress and output modules (see benchmark_runner.progress and
+  benchmark_runner.chained_progress).
 - Adds the adaptive ramp auto-tune engine (--auto-tune, see benchmark_runner.auto_tune).
 - Removes unnecessary subcommands, focusing on core benchmark and config functionality.
 
@@ -42,7 +43,7 @@ from benchmark_runner.openai_http_error_detail_backend import (
 )
 from benchmark_runner.scenario_builder import build_scenario_args
 from benchmark_runner.sharegpt_adapter import prepare_datasets
-from guidellm.benchmark.entrypoints import benchmark_generative_text
+from benchmark_runner.execution import benchmark_generative_text
 from benchmark_runner.progress import ServerBenchmarkerProgress
 from benchmark_runner.auto_tune import (
     RAMP_OUTCOME_POINTS_VERSION,
@@ -197,6 +198,7 @@ def _emit_curve_report(
             slo_thresholds=outcome.get("slo_thresholds") or {},
             elapsed_seconds=outcome.get("elapsed_seconds"),
             probe_ceiling=outcome.get("probe_ceiling"),
+            analysis=outcome.get("analysis"),
             mode=mode,
             style=style if style is not None else detect_style(stream),
         )
@@ -257,6 +259,8 @@ STRATEGY_PROFILE_CHOICES: list[str] = [
     "async",
     "constant",
     "poisson",
+    "knee",
+    "goodput",
 ]
 
 """Available backend type choices for benchmark execution."""
@@ -347,6 +351,13 @@ def _cb_parse_json(ctx, param, value):
     if isinstance(value, tuple):
         return tuple(_parse_json_scalar(item) for item in value)
     return _parse_json_scalar(value)
+
+
+def _cb_json_object(ctx, param, value):
+    parsed = _cb_parse_json(ctx, param, value)
+    if parsed is not None and not isinstance(parsed, dict):
+        raise click.BadParameter("must be a JSON object", ctx=ctx, param=param)
+    return parsed
 
 
 DISABLE_MACOS_WORKAROUNDS_ENV = "BENCHMARK_RUNNER_DISABLE_MACOS_WORKAROUNDS"
@@ -645,6 +656,30 @@ def benchmark():
         "async/constant/poisson=requests per second."
     ),
 )
+@click.option(
+    "--profile-args",
+    callback=_cb_json_object,
+    default=None,
+    help="JSON object of native profile settings, including knee/goodput options.",
+)
+@click.option(
+    "--metrics",
+    callback=_cb_json_object,
+    default=None,
+    help="GuideLLM generative metrics JSON: slo, confidence, warnings and sample_size.",
+)
+@click.option(
+    "--slo-attainment",
+    type=click.FloatRange(0, 1, min_open=True, max_open=True),
+    default=None,
+    help="Auto-tune joint request attainment target; requires per-request metrics.slo.",
+)
+@click.option(
+    "--plateau-confirmations",
+    type=click.IntRange(min=1),
+    default=2,
+    help="Consecutive low-growth points required to bracket auto-tune throughput.",
+)
 # Backend configuration
 @click.option(
     "--backend",
@@ -869,6 +904,12 @@ def benchmark():
 )
 # Constraints configuration
 @click.option(
+    "--min-completed-requests",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Keep supplying load until this many requests finish; exclusive with --max-requests.",
+)
+@click.option(
     "--max-seconds",
     type=float,
     default=_opt_default("max_seconds"),
@@ -1080,6 +1121,8 @@ def run(**kwargs):  # noqa: C901
     stages = kwargs.pop("stages", None)
     # Auto-tune knobs (consumed by the ramp engine, never passed to guidellm).
     auto_tune = kwargs.pop("auto_tune", False)
+    slo_attainment = kwargs.pop("slo_attainment", None)
+    plateau_confirmations = kwargs.pop("plateau_confirmations", 2)
     axis = kwargs.pop("axis", "rate")
     lower_bound = kwargs.pop("lower_bound", 4.0)
     upper_bound = kwargs.pop("upper_bound", 1024.0)
@@ -1123,6 +1166,33 @@ def run(**kwargs):  # noqa: C901
     if len(selected) > 1:
         raise click.UsageError(
             f"{selected[0]} is mutually exclusive with {', '.join(selected[1:])}."
+        )
+
+    if (
+        kwargs.get("max_requests") is not None
+        and kwargs.get("min_completed_requests") is not None
+    ):
+        raise click.UsageError(
+            "--max-requests and --min-completed-requests are mutually exclusive."
+        )
+    if kwargs.get("profile_args") and (auto_tune or stages):
+        raise click.UsageError(
+            "--profile-args cannot be combined with --auto-tune or --stages."
+        )
+    if kwargs.get("profile") in {"knee", "goodput"} and kwargs.get("rate"):
+        raise click.UsageError(
+            "--rate is not used by knee/goodput; use --profile-args."
+        )
+    if slo_attainment is not None:
+        if not auto_tune:
+            raise click.UsageError("--slo-attainment requires --auto-tune.")
+        if not (kwargs.get("metrics") or {}).get("slo"):
+            raise click.UsageError(
+                "--slo-attainment requires per-request objectives in --metrics (metrics.slo)."
+            )
+    if auto_tune and kwargs.get("min_completed_requests") is not None:
+        raise click.UsageError(
+            "--auto-tune derives completed counts; use --min-requests for its floor."
         )
 
     if auto_tune:
@@ -1193,6 +1263,8 @@ def run(**kwargs):  # noqa: C901
                 ctx=click.get_current_context(),
                 param_hint=".".join(loc) or "spec",
             ) from err
+        except ValueError as err:
+            raise click.BadParameter(str(err)) from err
 
         # The report is returned, not discarded: a stage list is a manual load
         # ladder, so its per-stage metrics are the same curve the ramp charts and
@@ -1230,6 +1302,8 @@ def run(**kwargs):  # noqa: C901
             upper_bound=upper_bound,
             multiplier=multiplier,
             min_requests=min_requests,
+            slo_attainment=slo_attainment,
+            plateau_confirmations=plateau_confirmations,
             max_points=max_points,
             max_total_seconds=max_total_seconds,
             slo_avg_ttft_ms=slo_avg_ttft_ms,

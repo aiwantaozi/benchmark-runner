@@ -238,7 +238,10 @@ def build_scenario_args(kwargs: dict[str, Any]) -> BenchmarkScenario:  # noqa: C
     profile_kind = kwargs.pop("profile", None) or "sweep"
     rate = _flatten_rate(kwargs.pop("rate", None))
     max_concurrency = kwargs.pop("max_concurrency", None)
-    profile: dict[str, Any] = {"kind": profile_kind}
+    profile_args = kwargs.pop("profile_args", None) or {}
+    if not isinstance(profile_args, dict) or "kind" in profile_args:
+        raise ValueError("profile_args must be an object without a kind field")
+    profile: dict[str, Any] = {"kind": profile_kind, **profile_args}
     if profile_kind == "concurrent":
         if rate:
             profile["streams"] = [int(r) for r in rate]
@@ -329,15 +332,30 @@ def build_scenario_args(kwargs: dict[str, Any]) -> BenchmarkScenario:  # noqa: C
         spec["data_column_mapper"] = {"kind": "generative_column_mapper", **dcm}
 
     # ── Metrics (output request sampling) ───────────────────────────────────
+    metrics = kwargs.pop("metrics", None)
+    if metrics is not None and not isinstance(metrics, dict):
+        raise ValueError("metrics must be a JSON object")
+    metrics = dict(metrics or {})
+    if metrics.get("kind", "generative") != "generative":
+        raise ValueError("metrics.kind must be 'generative'")
     sample_requests = kwargs.pop("sample_requests", None)
     if sample_requests is not None:
-        spec["metrics"] = {"kind": "generative", "sample_size": int(sample_requests)}
+        metrics["sample_size"] = int(sample_requests)
+    if metrics:
+        spec["metrics"] = {"kind": "generative", **metrics}
 
     # ── Constraints ─────────────────────────────────────────────────────────
     constraints: list[dict[str, Any]] = []
     max_requests = kwargs.pop("max_requests", None)
+    min_completed = kwargs.pop("min_completed_requests", None)
+    if max_requests is not None and min_completed is not None:
+        raise ValueError(
+            "max_requests and min_completed_requests are mutually exclusive"
+        )
     if max_requests is not None:
         constraints.append({"kind": "max_requests", "count": int(max_requests)})
+    if min_completed is not None:
+        constraints.append({"kind": "min_requests", "count": int(min_completed)})
     max_seconds = kwargs.pop("max_seconds", None)
     if max_seconds is not None:
         constraints.append({"kind": "max_duration", "seconds": float(max_seconds)})

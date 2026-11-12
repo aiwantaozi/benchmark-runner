@@ -32,10 +32,14 @@ from typing import Any, ClassVar, Literal
 from pydantic import Field
 
 from guidellm.benchmark.outputs.output import GenerativeBenchmarkerOutput
-from guidellm.benchmark.schemas import BenchmarkOutputArgs, GenerativeBenchmarksReport
+from guidellm.benchmark.schemas import GenerativeBenchmarksReport
+from guidellm.schemas.benchmark import BenchmarkOutputArgs
 from guidellm.schemas import StatusDistributionSummary
 
-from benchmark_runner.openai_http_error_detail_backend import ITL_TIMINGS_FIELD
+from benchmark_runner.openai_http_error_detail_backend import (
+    ITL_TIMINGS_FIELD,
+    ITL_TIMESTAMPS_FIELD,
+)
 
 __all__ = [
     "GenerativeBenchmarkerDualJson",
@@ -131,7 +135,7 @@ class AutoMarshalJSONEncoder(json.JSONEncoder):
             return o.__class_json__()
 
         # Check if the object has a __json__ method (for instances)
-        if hasattr(o, "__json__") and callable(getattr(o, "__json__")):
+        if hasattr(o, "__json__") and callable(o.__json__):
             return o.__json__()
 
         # Handle class/type objects (like request handler classes)
@@ -377,7 +381,17 @@ class GenerativeBenchmarkerDualJson(GenerativeBenchmarkerOutput):
                 timings = getattr(timings, "timings", None)
                 gaps = getattr(timings, ITL_TIMINGS_FIELD, None)
                 if gaps:
-                    flattened.extend(float(gap) for gap in gaps)
+                    timestamps = getattr(timings, ITL_TIMESTAMPS_FIELD, None)
+                    if timestamps is not None and len(timestamps) == len(gaps):
+                        flattened.extend(
+                            float(gap)
+                            for gap, timestamp in zip(gaps, timestamps)
+                            if (start is None or timestamp >= start)
+                            and (end is None or timestamp <= end)
+                        )
+                    else:
+                        # Older reports contain gaps without event timestamps.
+                        flattened.extend(float(gap) for gap in gaps)
             return flattened
 
         successful = samples(getattr(requests, "successful", None))
@@ -410,6 +424,7 @@ class GenerativeBenchmarkerDualJson(GenerativeBenchmarkerOutput):
                 timings = (request or {}).get("info", {}).get("timings")
                 if isinstance(timings, dict):
                     timings.pop(ITL_TIMINGS_FIELD, None)
+                    timings.pop(ITL_TIMESTAMPS_FIELD, None)
 
     def _attach_error_samples(
         self, summary_dict: dict[str, Any], full_dict: dict[str, Any]

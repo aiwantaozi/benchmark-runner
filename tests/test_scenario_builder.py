@@ -47,6 +47,69 @@ def base_kwargs(**extra):
     )
 
 
+def test_completed_count_and_metrics_are_forwarded():
+    kwargs = base_kwargs(
+        min_completed_requests=100,
+        metrics={"slo": {"ttft_ms": 200}, "confidence": 0.99},
+        sample_requests=5,
+    )
+    kwargs.pop("max_requests")
+    scenario = build_scenario_args(kwargs)
+    assert [(c.kind, c.count) for c in scenario.spec.constraints] == [
+        ("min_requests", 100)
+    ]
+    assert scenario.spec.metrics.slo.ttft_ms == 200
+    assert scenario.spec.metrics.confidence == 0.99
+    assert scenario.spec.metrics.sample_size == 5
+
+
+def test_explicit_generative_metrics_preserve_settings():
+    scenario = build_scenario_args(
+        base_kwargs(
+            metrics={"kind": "generative", "slo": {"ttft_ms": 200}, "confidence": 0.99},
+            sample_requests=5,
+        )
+    )
+    assert scenario.spec.metrics.kind == "generative"
+    assert scenario.spec.metrics.slo.ttft_ms == 200
+    assert scenario.spec.metrics.confidence == 0.99
+    assert scenario.spec.metrics.sample_size == 5
+
+
+@pytest.mark.parametrize("kind", ["audio", "unsupported", None])
+def test_unsupported_metrics_kind_is_rejected_with_a_clear_error(kind):
+    with pytest.raises(ValueError, match="metrics.kind must be 'generative'"):
+        build_scenario_args(base_kwargs(metrics={"kind": kind}))
+
+
+def test_conflicting_request_count_modes_are_rejected():
+    with pytest.raises(ValueError, match="max_requests.*min_completed_requests"):
+        build_scenario_args(base_kwargs(min_completed_requests=100))
+
+
+@pytest.mark.parametrize(
+    "profile,args,metrics",
+    [
+        ("knee", {"initial_streams": [1, 2, 4, 8, 16]}, {}),
+        ("goodput", {"max_streams": 32}, {"slo": {"ttft_ms": 200}}),
+    ],
+)
+def test_native_adaptive_profiles_build(profile, args, metrics):
+    scenario = build_scenario_args(
+        base_kwargs(profile=profile, profile_args=args, metrics=metrics)
+    )
+    assert scenario.spec.profile.kind == profile
+    for key, value in args.items():
+        assert getattr(scenario.spec.profile, key) == value
+
+
+def test_profile_args_cannot_change_the_selected_kind():
+    with pytest.raises(ValueError, match="profile_args.*kind"):
+        build_scenario_args(
+            base_kwargs(profile="constant", profile_args={"kind": "throughput"})
+        )
+
+
 @pytest.mark.parametrize(
     "processor_args",
     [

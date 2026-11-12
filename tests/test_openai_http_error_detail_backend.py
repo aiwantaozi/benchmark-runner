@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -140,6 +141,58 @@ def _started_backend(handler: httpx.MockTransport) -> OpenAIHTTPErrorDetailBacke
 
 async def _drain(agen) -> list:
     return [item async for item in agen]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_request_uses_header_write_timestamp_trace(streaming, monkeypatch):
+    seen = []
+    request_info = RequestInfo(request_id="req-1")
+    clock = SimpleNamespace(now=123.0)
+    monkeypatch.setattr(
+        "guidellm.backends.openai.http.time",
+        SimpleNamespace(time=lambda: clock.now),
+    )
+
+    async def transport(request):
+        trace = request.extensions["trace"]
+        seen.append(trace)
+        initial_start = request_info.timings.request_start
+        await trace("http11.receive_response_headers.started", {})
+        assert request_info.timings.request_start == initial_start
+        await trace("http11.send_request_headers.started", {})
+        assert (
+            request_info.timings.request_start == 123.0
+        ), "header-write event must timestamp request start"
+        clock.now = 456.0
+        await trace("http11.send_request_headers.started", {})
+        assert request_info.timings.request_start == 123.0
+        return httpx.Response(200, content=b"data: [DONE]\n\n" if streaming else b"{}")
+
+    backend = _started_backend(httpx.MockTransport(transport))
+
+    async def run():
+        method = (
+            backend._resolve_streaming if streaming else backend._resolve_non_streaming
+        )
+        try:
+            await _drain(
+                method(
+                    GenerationRequest(),
+                    request_info,
+                    _RecordingHandler(),
+                    GenerationRequestArguments(),
+                    {
+                        "method": "POST",
+                        "url": "http://localhost:8000/v1/chat/completions",
+                    },
+                )
+            )
+        finally:
+            await backend._async_client.aclose()
+
+    asyncio.run(run())
+    assert len(seen) == 1
+    assert request_info.timings.request_start == 123.0
 
 
 @pytest.mark.parametrize("reject", [False, True])

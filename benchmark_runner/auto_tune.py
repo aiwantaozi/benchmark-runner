@@ -24,7 +24,7 @@ point) and reads the metrics back to decide the next point:
                             sits at the bracket's left end (see Phase 2 below).
 
 Each ramp point is ONE ``benchmark_generative_text`` invocation with a single
-``concurrent``/``constant`` strategy, a ``max_requests`` constraint, and a
+``concurrent``/``constant`` strategy, a ``min_requests`` constraint, and a
 DISTINCT random seed (defeats prefix/KV cache reuse across points). Each
 point writes its own dual_json pair ``{base}__p{index}.json`` /
 ``{base}__p{index}.full.json`` which the gpustack manager globs.
@@ -41,16 +41,15 @@ from dataclasses import asdict, dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 from guidellm.benchmark import BenchmarkScenario
-from guidellm.benchmark.entrypoints import benchmark_generative_text
+from benchmark_runner.constants import SUCCESS_FLOOR
+from benchmark_runner.execution import benchmark_generative_text
+from benchmark_runner.curve_analysis import analyze_curve, goodput_fields, passes_slo
 
 from benchmark_runner.scenario_builder import (
     DEFAULT_MAX_CONCURRENCY,
     build_scenario_args,
 )
 
-# 95% success floor shared by both stop targets. Peak probing uses
-# a loose floor (not 100%) so a stray timeout doesn't prematurely cut the peak.
-SUCCESS_FLOOR = 0.95
 # Throughput plateau threshold: <5% gain over previous point = saturated.
 PLATEAU_GAIN = 0.05
 # SLO expansion may stop protectively after sustained, substantial total-throughput loss.
@@ -120,7 +119,8 @@ STOP_POINT_FAILED = "point_failed"  # a point produced no benchmark
 # Protective-stop evidence records the policy and measured reference at the stop,
 # so consumers can explain it without assuming their current policy applied.
 # Peak refinement records the measured window and coverage behind gain convergence.
-RAMP_OUTCOME_VERSION = 7
+# v8 adds per-request goodput and distinct fitted/measured capacity conclusions.
+RAMP_OUTCOME_VERSION = 8
 
 # The version that first carried ``points``. Named separately from the current
 # version because it is the floor a chartable sidecar has to clear, and the two
@@ -215,7 +215,15 @@ class PointMetrics:
     latency_p95_ms: float  # ...request_latency.successful.percentiles.p95 * 1000
     latency_p99_ms: float  # ...request_latency.successful.percentiles.p99 * 1000
     achieved_rate: float  # metrics.requests_per_second.successful.mean
-    success: float  # successful / total
+    success: (
+        float  # successful / total, excluding planned completed-count cancellations
+    )
+    slo_attainment: Optional[float] = None
+    slo_determined_requests: int = 0
+    request_goodput: Optional[float] = None
+    slo_attainment_lower: Optional[float] = None
+    slo_attainment_upper: Optional[float] = None
+    slo_attainment_confidence: Optional[float] = None
 
 
 @dataclass
@@ -293,6 +301,17 @@ class AutoTuneConfig:
     # soft cap yields when the ceiling estimate turns out to be too low. See
     # run_ramp for the probe + bounding logic.
     probe_saturation: bool = True
+    # A single low-growth sample can reflect noise or batching transitions.
+    plateau_confirmations: int = 2
+    slo_attainment: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.plateau_confirmations, bool)
+            or not isinstance(self.plateau_confirmations, int)
+            or self.plateau_confirmations < 1
+        ):
+            raise ValueError("plateau_confirmations must be a positive integer")
 
     @property
     def resolved_multiplier(self) -> float:
@@ -331,6 +350,7 @@ class AutoTuneConfig:
             "slo_avg_latency_ms",
             "slo_p95_latency_ms",
             "slo_p99_latency_ms",
+            "slo_attainment",
         )
         return {
             name: float(getattr(self, name))
@@ -405,6 +425,8 @@ class RampOutcome:
     # Actual trigger measurements; absent when the decline guard did not stop the run.
     throughput_decline: Optional[dict[str, Any]] = None
     throughput_gain_evidence: Optional[dict[str, Any]] = None
+    goodput_slo: Optional[dict[str, float]] = None
+    plateau_confirmations: int = 2
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serializable facts, including the measured grid (see the version note)."""
@@ -429,6 +451,7 @@ class RampOutcome:
             "probe_relaxed": self.probe_relaxed,
             "probe_bound": self.probe_bound,
             "slo_thresholds": self.slo_thresholds or {},
+            "plateau_confirmations": self.plateau_confirmations,
         }
         if self.throughput_decline is not None:
             facts["throughput_decline"] = self.throughput_decline
@@ -437,6 +460,11 @@ class RampOutcome:
             and self.throughput_gain_evidence is not None
         ):
             facts["throughput_gain_evidence"] = self.throughput_gain_evidence
+        facts["analysis"] = analyze_curve(
+            self.points, axis=self.axis, slo_thresholds=self.slo_thresholds or {}
+        )
+        if self.goodput_slo is not None:
+            facts["goodput_slo"] = self.goodput_slo
         return facts
 
 
@@ -460,6 +488,14 @@ def _normalize(benchmark: Any, knob: float, index: int) -> PointMetrics:
     totals = m.request_totals
     total = getattr(totals, "total", 0) or 0
     successful = getattr(totals, "successful", 0) or 0
+    state = getattr(benchmark, "scheduler_state", None)
+    actions = getattr(state, "end_processing_constraints", {}) or {}
+    completed_stop = actions.get("min_requests")
+    if completed_stop and completed_stop.metadata.get("processed_exceeded") is True:
+        # A completed-count stop cancels the remaining in-flight requests by
+        # design. Those boundary cancellations must not look like server errors
+        # or falsely trip the success floor at high concurrency.
+        total -= getattr(totals, "incomplete", 0) or 0
     success = (successful / total) if total else 0.0
     return PointMetrics(
         knob=knob,
@@ -496,6 +532,7 @@ def _normalize(benchmark: Any, knob: float, index: int) -> PointMetrics:
         * 1000.0,
         achieved_rate=_mean(m, "requests_per_second", "successful", "mean"),
         success=success,
+        **goodput_fields(benchmark),
     )
 
 
@@ -505,20 +542,7 @@ def _passes_slo(m: PointMetrics, cfg: AutoTuneConfig) -> bool:
     AND is taken over SET thresholds only; unset (None) thresholds are ignored.
     Up to 9 dimensions: avg+p95+p99 of TTFT, ITL, and end-to-end latency (all ms).
     """
-    if m.success < SUCCESS_FLOOR:
-        return False
-    for threshold, value in cfg.slo_pairs(m):
-        if threshold is None:
-            continue
-        # A non-positive value means the metric was not measured, not that it took
-        # 0 ms: `_normalize` returns 0.0 for anything missing from the report, and
-        # the decode-only reading is genuinely undefined when requests emit a single
-        # token (no second token to time), which guidellm reports as 0.0. Waiving
-        # the threshold there would let a max_tokens=1 run pass every point and
-        # ramp to the upper bound. Failing instead surfaces it as slo_never_met.
-        if value <= 0 or value > threshold:
-            return False
-    return True
+    return passes_slo(m, cfg.set_thresholds())
 
 
 def _capacity_saturated(
@@ -748,7 +772,8 @@ async def run_ramp(  # noqa: C901
 
         local = dict(base_kwargs)
         local["random_seed"] = seed
-        local["max_requests"] = number
+        local.pop("max_requests", None)
+        local["min_completed_requests"] = number
         # Bound this point by whatever is left of the total budget, so a stalled
         # point cannot overrun it (see _remaining_seconds).
         local["max_seconds"] = _remaining_seconds()
@@ -764,8 +789,8 @@ async def run_ramp(  # noqa: C901
             # the constant profile untouched (see scenario_builder).
 
         args = _build_args(local)
-        # max_requests is carried in the scenario spec.constraints (built from
-        # local["max_requests"]); no need to also pass it as a **constraints kwarg.
+        # Completed-request counting keeps the pipeline full through the sample
+        # target. The remaining-time constraint still bounds stalled points.
         report, _ = await benchmark_generative_text(
             args=args, progress=progress, console=console
         )
@@ -777,6 +802,8 @@ async def run_ramp(  # noqa: C901
     _run_point = run_point if run_point is not None else _default_run_point
 
     points: list[PointMetrics] = []
+    plateau_streak = 0
+    plateau_lower: Optional[float] = None
     knob = float(cfg.lower_bound)
     prev_tps: Optional[float] = None
     prev_achieved: Optional[float] = None
@@ -961,7 +988,19 @@ async def run_ramp(  # noqa: C901
             # shared detector decides the bracket. See _capacity_saturated for why
             # both signals compare CONSECUTIVE points instead of achieved-vs-offered.
             overloaded = m.success < SUCCESS_FLOOR
-            if overloaded or _capacity_saturated(m, prev_tps, prev_achieved, cfg.axis):
+            plateau = _capacity_saturated(m, prev_tps, prev_achieved, cfg.axis)
+            if plateau:
+                plateau_streak += 1
+                if plateau_lower is None:
+                    plateau_lower = (
+                        prev_prev_knob
+                        if prev_prev_knob is not None
+                        else float(cfg.lower_bound)
+                    )
+            else:
+                plateau_streak = 0
+                plateau_lower = None
+            if overloaded or plateau_streak >= cfg.plateau_confirmations:
                 bracket_reason = (
                     STOP_OVERLOADED if overloaded else STOP_CAPACITY_PLATEAU
                 )
@@ -990,6 +1029,8 @@ async def run_ramp(  # noqa: C901
                         else max(float(cfg.lower_bound), prev_knob / 2.0)
                     )
                     sat_bracket = (lo, knob)
+                    if plateau_lower is not None:
+                        sat_bracket = (min(lo, plateau_lower), knob)
                 break
             prev_tps = m.total_tps
             prev_achieved = m.achieved_rate
@@ -1225,6 +1266,8 @@ async def run_ramp(  # noqa: C901
         slo_thresholds=cfg.set_thresholds(),
         throughput_decline=decline_evidence,
         throughput_gain_evidence=gain_evidence,
+        goodput_slo=(base_kwargs.get("metrics") or {}).get("slo"),
+        plateau_confirmations=cfg.plateau_confirmations,
     )
 
 

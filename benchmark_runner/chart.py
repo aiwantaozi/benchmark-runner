@@ -39,11 +39,8 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
-# A point's success rate below this = overloaded. Same floor the ramp brackets on
-# (auto_tune.SUCCESS_FLOOR) and the same 5% failure rate gpustack-ui gates its
-# "overloaded" badge on. Duplicated rather than imported to keep this module a
-# leaf: it is also driven by the `chart` subcommand, which has no ramp in memory.
-SUCCESS_FLOOR = 0.95
+from benchmark_runner.constants import SUCCESS_FLOOR
+
 # Past the peak, a point counts as declining once it delivers less than this share
 # of the peak throughput. Being merely one step past the recommended knee at ~peak
 # throughput is NOT overload — that point is often the true argmax.
@@ -556,6 +553,7 @@ def render_curve_report(
     slo_thresholds: Optional[dict] = None,
     elapsed_seconds: Optional[float] = None,
     probe_ceiling: Optional[float] = None,
+    analysis: Optional[dict] = None,
     mode: str = CHART_AUTO,
     style: Optional[Style] = None,
 ) -> list[str]:
@@ -621,6 +619,29 @@ def render_curve_report(
         out.append("")
 
     out += _table(ordered, statuses, axis, style)
+    if analysis:
+        peak = analysis.get("throughput_peak")
+        knee = analysis.get("throughput_knee") or {}
+        capacity = analysis.get("slo_capacity")
+        out.append("")
+        if peak:
+            out.append(
+                f"  Measured total-throughput peak: {peak['knob']:g} ({peak['value']:g} tok/s)"
+            )
+        if knee.get("status") == "ok":
+            out.append(
+                f"  Fitted output-throughput knee: {knee['knee']:g} concurrency "
+                "(requires measurement)"
+            )
+        else:
+            out.append(f"  Output-throughput knee: {knee.get('status', 'unavailable')}")
+        if capacity:
+            out.append(f"  SLO highest measured pass: {capacity['knob']:g}")
+        if analysis.get("unresolved_slo_knobs"):
+            out.append(
+                "  Joint SLO attainment is unresolved at some measured loads; "
+                "increase samples or duration."
+            )
     out.append("")
     out += _verdict(
         ordered,

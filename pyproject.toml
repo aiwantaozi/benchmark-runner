@@ -25,7 +25,7 @@ keywords = [
 dependencies = [
     # Used directly by progress reporting; do not rely on transitive dependencies.
     "aiohttp",
-    "guidellm==0.7.3",
+    "guidellm==0.8.1",
     # Required by some models' tokenizers (e.g. Kimi-K2) for synthetic_text
     # dataset deserialization. Not pulled in transitively by guidellm. (#5689)
     "tiktoken",

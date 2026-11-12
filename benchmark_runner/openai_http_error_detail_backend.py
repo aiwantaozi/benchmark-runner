@@ -1,12 +1,14 @@
 """
 The core flow in this module is adapted from GuideLLM's OpenAI backend:
-- Source: guidellm v0.7.3, ``src/guidellm/backends/openai/http.py``
-  (https://github.com/vllm-project/guidellm/tree/v0.7.3)
+- Source: guidellm v0.8.1, ``src/guidellm/backends/openai/http.py``
+  (https://github.com/vllm-project/guidellm/tree/v0.8.1)
 - Reference implementation: `guidellm/backends/openai/http.py::OpenAIHTTPBackend`
+
+The pinned parent class supplies ``_trace_request_start`` for both HTTP paths.
 
 Adjustments in this module:
 1) Register a new backend type `openai_http_error_detail` (args + implementation).
-2) Keep the request/stream processing flow aligned with GuideLLM 0.7.3 (reuse the
+2) Keep the request/stream processing flow aligned with GuideLLM 0.8.1 (reuse the
    base `_prepare_resolve_request`, which formats the request, filters ``None`` via
    ``deep_filter`` and builds the httpx kwargs).
 3) For HTTP error responses, read the body early (`aread()`) before the stream
@@ -99,9 +101,11 @@ MAX_ERROR_DETAIL_LENGTH = 2048
 # (``output_dual_json``) reads it back; a typo on either side would silently
 # produce an empty distribution instead of failing.
 ITL_TIMINGS_FIELD = "inter_token_latencies_ms"
+ITL_TIMESTAMPS_FIELD = "inter_token_latency_timestamps"
 
 __all__ = [
     "ERROR_DETAIL_BACKEND_TYPE",
+    "ITL_TIMESTAMPS_FIELD",
     "ITL_TIMINGS_FIELD",
     "MAX_ERROR_DETAIL_LENGTH",
     "OpenAIHTTPErrorDetailBackend",
@@ -329,7 +333,10 @@ class OpenAIHTTPErrorDetailBackend(OpenAIHTTPBackend):
             raise RuntimeError("Backend not started up for process.")
 
         request_info.timings.request_start = time.time()
-        response = await self._async_client.request(**request_kwargs)
+        response = await self._async_client.request(
+            **request_kwargs,
+            extensions={"trace": self._trace_request_start(request_info)},
+        )
         request_info.timings.request_end = time.time()
         if response.is_error:
             raise RuntimeError(
@@ -397,11 +404,15 @@ class OpenAIHTTPErrorDetailBackend(OpenAIHTTPBackend):
         # samples". The first chunk has no predecessor and contributes nothing:
         # that interval is TTFT.
         itl_gaps_ms: list[float] = []
+        itl_timestamps: list[float] = []
 
         try:
             request_info.timings.request_start = time.time()
 
-            async with self._async_client.stream(**request_kwargs) as stream:
+            async with self._async_client.stream(
+                **request_kwargs,
+                extensions={"trace": self._trace_request_start(request_info)},
+            ) as stream:
                 if stream.is_error:
                     request_info.timings.request_end = time.time()
                     raise RuntimeError(
@@ -449,12 +460,14 @@ class OpenAIHTTPErrorDetailBackend(OpenAIHTTPBackend):
                     prev_iter = request_info.timings.last_token_iteration
                     if prev_iter is not None:
                         itl_gaps_ms.append((iter_time - prev_iter) * 1000.0)
+                        itl_timestamps.append(iter_time)
 
                     request_info.timings.last_token_iteration = iter_time
                     request_info.timings.token_iterations += iterations
 
             request_info.timings.request_end = time.time()
             setattr(request_info.timings, ITL_TIMINGS_FIELD, itl_gaps_ms)
+            setattr(request_info.timings, ITL_TIMESTAMPS_FIELD, itl_timestamps)
             gen_response = request_handler.compile_streaming(request, arguments)
             request_handler.post_validation(gen_response)
             self._check_tool_call_expectations(request, gen_response)
@@ -465,5 +478,6 @@ class OpenAIHTTPErrorDetailBackend(OpenAIHTTPBackend):
             # but dropping the samples here would make the partial record lie
             # about having none.
             setattr(request_info.timings, ITL_TIMINGS_FIELD, itl_gaps_ms)
+            setattr(request_info.timings, ITL_TIMESTAMPS_FIELD, itl_timestamps)
             yield request_handler.compile_streaming(request, arguments), request_info
             raise err
