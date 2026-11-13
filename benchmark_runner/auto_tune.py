@@ -1037,8 +1037,11 @@ async def run_ramp(  # noqa: C901
                     and m.achieved_rate > probe_ceiling * (1.0 + PLATEAU_GAIN)
                 )
                 if soft_cap and still_keeping_up:
+                    # A probe can put its cap below the configured start. Relax
+                    # beyond this measured load so the next point advances and
+                    # remains inside the user's search range.
                     saturation_bound = min(
-                        float(cfg.upper_bound), saturation_bound * 2.0
+                        float(cfg.upper_bound), max(saturation_bound, knob) * 2.0
                     )
                     probe_relaxed += 1
                     bound = _bound()

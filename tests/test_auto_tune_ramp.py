@@ -1320,6 +1320,68 @@ def test_probe_relaxes_its_cap_when_the_ceiling_was_underestimated():
     assert peak_tps(pts) >= 199_000, f"must still find the ~200 peak: {knobs(pts)}"
 
 
+@pytest.mark.parametrize("lower", [2, 4, 64, 1024])
+def test_underestimated_probe_relaxes_past_the_current_load(lower):
+    outcome = run_outcome(
+        sat_cfg(
+            axis="rate",
+            lower_bound=lower,
+            upper_bound=lower * 8,
+            probe_saturation=True,
+        ),
+        make_run_point(lambda k: k * 1000.0),
+        probe=make_probe(0.2),
+    )
+
+    loads = knobs(outcome.points)
+    assert loads == [float(lower * factor) for factor in (1, 2, 4, 8)]
+    assert outcome.probe_relaxed == 3
+    assert outcome.stop_reason == STOP_UPPER_BOUND
+
+
+def test_underestimated_probe_still_respects_a_narrow_hard_bound():
+    outcome = run_outcome(
+        sat_cfg(
+            axis="rate",
+            lower_bound=64,
+            upper_bound=65,
+            probe_saturation=True,
+        ),
+        make_run_point(lambda k: k * 1000.0),
+        probe=make_probe(0.2),
+    )
+
+    loads = knobs(outcome.points)
+    assert loads[:2] == [64.0, 65.0]
+    assert all(64.0 <= load <= 65.0 for load in loads)
+    assert len(loads) == len(set(loads))
+    assert outcome.probe_bound == 65.0
+
+
+def test_underestimated_probe_does_not_fabricate_a_plateau_at_the_floor():
+    outcome = run_outcome(
+        sat_cfg(
+            axis="rate",
+            lower_bound=4,
+            upper_bound=8192,
+            max_points=15,
+            probe_saturation=True,
+        ),
+        make_run_point(
+            lambda k: min(k, 8.0) * 1000.0,
+            achieved_fn=lambda k: min(k, 8.0),
+        ),
+        probe=make_probe(0.19997956008019296),
+    )
+
+    loads = knobs(outcome.points)
+    assert loads[:3] == [4.0, 8.0, 16.0]
+    assert len(loads) == len(set(loads))
+    assert peak_tps(outcome.points) == 8000.0
+    assert outcome.bracket_reason == STOP_CAPACITY_PLATEAU
+    assert outcome.stop_reason in (STOP_CONVERGED, STOP_THROUGHPUT_GAIN_CONVERGED)
+
+
 def test_probe_caps_upper_bound():
     # Ceiling 20 -> upper capped at ceil(20*1.2)=24; ramp must not run past it.
     curve = piecewise({1: 100, 5: 6000, 10: 12000, 16: 15000, 20: 14000})
